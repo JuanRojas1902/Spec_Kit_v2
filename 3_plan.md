@@ -1,308 +1,388 @@
-# Plan técnico — v2: Investigación con relaciones
+# Plan técnico — Versión 2: Investigación con llaves foráneas y maestro-detalle
 
-> **Estado:** borrador. Los `[NECESITA ACLARACIÓN]` se resuelven con el SQL
-> oficial antes de empezar a programar.
+> **Versión 2** · CÓMO construir lo especificado en [2_spec.md](2_spec.md).
+> El porqué de cada decisión: [4_research.md](4_research.md) · contratos
+> exactos: [6_api_contract.md](6_api_contract.md) · orden: [8_tasks.md](8_tasks.md).
 
-## 1. Secuencia de desarrollo
+> **Estado:** borrador para la Compuerta 2. Los `[NECESITA ACLARACIÓN]` se
+> resuelven con el SQL oficial antes de programar.
 
-1. **Base de datos:** procedimientos almacenados (CRUD) de las 10 tablas,
-   los 3 triggers (propuesta A en `universidad`) y las reglas de negocio
-   (bloqueo de retiro con `SIGNAL SQLSTATE '45000'`).
-2. **Repositorios:** reemplazar el SQL directo por `CALL sp_...` y capturar
-   los errores de MariaDB (1452, 1062, 1451 y `'45000'`).
-3. **Servicios y controladores:** devolver `409 Conflict` con mensajes en
-   español.
-4. **Frontend:** pantallas Maestro-Detalle y `<select>` dinámicos en lugar de
-   escribir las llaves foráneas.
+---
 
-## 2. Qué cambia respecto a la v1
+## 1. Stack
 
-La v2 **incluye** la v1: lo que ya funciona no se toca, solo se agrega.
+El mismo de la v1, sin una dependencia nueva. Lo que cambia no es la
+tecnología: es cuántas piezas hay y cómo se relacionan.
 
-| Capa | Cambio |
-|---|---|
-| Base de datos | `ALTER` para `activo`, procedimientos y triggers |
-| Repositorios | Ahora hacen `CALL` en vez de SQL escrito en PHP |
-| Servicios | Nueva excepción `ConflictoExcepcion` y reglas de retiro |
-| Controladores | Nuevo caso: responder `409` |
-| Frontend | Desplegables, maestro-detalle y manejo de la tabla vacía (`204`) |
-
-La arquitectura por capas es la misma:
-
-```text
-Frontend → API → Controlador → Servicio → Repositorio → CALL sp_... → MariaDB
-```
-
-## 3. Archivos nuevos
-
-```text
-db/
-├── init.sql                 ← esquema y datos (ya existe)
-└── procedimientos.sql       ← ALTER, procedimientos y triggers (nuevo)
-
-api_investigacion/
-├── controladores/           ← un controlador por cada tabla nueva
-├── servicios/               ← un servicio (y su interfaz) por tabla
-├── repositorios/            ← un repositorio (y su interfaz) por tabla
-├── modelos/                 ← una clase por tabla
-├── excepciones/
-│   └── ConflictoExcepcion.php   ← nueva
-└── pruebas/
-    └── prueba_capas_v2.php
-
-front_investigacion/
-└── vistas/                  ← lista, formulario y detalle por tabla
-```
-
-`[NECESITA ACLARACIÓN: nombres exactos de las 10 tablas y sus columnas, tomados del SQL oficial.]`
-
-## 4. Base de datos
-
-### 4.1 Cambios de esquema
-
-- Agregar `activo TINYINT(1) NOT NULL DEFAULT 1` a las tablas que no lo tengan.
-- Agregar a `universidad` la columna del contador del trigger (ver §5).
-
-`[NECESITA ACLARACIÓN: ¿las tablas puente llevan activo o se borran físicamente?]`
-
-### 4.2 Procedimientos almacenados
-
-Cinco por tabla, con el nombre que exige la guía:
-
-| Operación | Procedimiento |
-|---|---|
-| Listar | `sp_listar_<tabla>` |
-| Ver uno | `sp_consultar_<tabla>` |
-| Crear | `sp_crear_<tabla>` |
-| Actualizar | `sp_actualizar_<tabla>` |
-| Retirar | `sp_eliminar_<tabla>` |
-
-Reglas:
-
-- Se escriben con `DELIMITER $$` y `CREATE OR REPLACE PROCEDURE`, para poder
-  correr el script varias veces.
-- `listar` y `consultar` filtran `activo = 1`.
-- `crear` devuelve la fila que quedó guardada. Si la llave es
-  `AUTO_INCREMENT`, guarda `LAST_INSERT_ID()` en una variable antes de otra
-  sentencia.
-- `eliminar` hace `UPDATE ... SET activo = 0`, nunca `DELETE`.
-- `PUT` y `PATCH` usan el mismo `sp_actualizar`: el servicio lee el registro
-  actual, mezcla los campos enviados y llama al procedimiento con todos.
-
-Ejemplo del bloqueo de retiro (grupo con semilleros activos):
-
-```sql
-DELIMITER $$
-
-CREATE OR REPLACE PROCEDURE sp_eliminar_grupo_investigacion(IN p_id INT)
-BEGIN
-    IF EXISTS (SELECT 1 FROM semillero
-               WHERE grupo_id = p_id AND activo = 1) THEN
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'Primero retire los semilleros de este grupo.';
-    END IF;
-
-    UPDATE grupo_investigacion SET activo = 0 WHERE id = p_id AND activo = 1;
-END$$
-
-DELIMITER ;
-```
-
-`[NECESITA ACLARACIÓN: nombres reales de las columnas (grupo_id, id...).]`
-
-## 5. Los 3 triggers (propuesta A: contador en `universidad`)
-
-`universidad` guarda cuántos grupos activos tiene, y **se mantiene sola**
-sin que la API la envíe.
-
-En MariaDB un trigger atiende **un solo evento**, así que son tres, y los
-tres llaman a un procedimiento común:
-
-| Trigger | Cuándo | Qué hace |
+| Pieza | Elección | Qué cambia respecto de la v1 |
 |---|---|---|
-| `trg_grupo_ai` | Después de `INSERT` en `grupo_investigacion` | Recalcula el total de esa universidad |
-| `trg_grupo_au` | Después de `UPDATE` | Recalcula la universidad nueva y la anterior |
-| `trg_grupo_ad` | Después de `DELETE` | Recalcula el total |
+| Lenguaje | **PHP 8.3**, `declare(strict_types=1)` | nada |
+| Framework / paquetes | **NINGUNO** | nada |
+| Acceso a datos | **PDO** con parámetros `?` | **+ `CALL` a procedimientos almacenados** solo para `grupo_investigacion` y su detalle |
+| Front | PHP puro, plantillas, Bootstrap local | una sección por recurso nuevo |
+| Motor | **MariaDB**, y solo MariaDB | nada |
 
-```sql
-DELIMITER $$
+## 2. Estructura de carpetas
 
-CREATE OR REPLACE PROCEDURE sp_recalcular_total_grupos(IN p_universidad INT)
-BEGIN
-    UPDATE universidad
-    SET total_grupos = (SELECT COUNT(*) FROM grupo_investigacion
-                        WHERE universidad_id = p_universidad AND activo = 1)
-    WHERE id = p_universidad;
-END$$
-
-CREATE OR REPLACE TRIGGER trg_grupo_ai AFTER INSERT ON grupo_investigacion
-FOR EACH ROW CALL sp_recalcular_total_grupos(NEW.universidad_id)$$
-
-DELIMITER ;
+```text
+(raíz del proyecto)
+├── README.md                          # qué es el proyecto y cómo arrancarlo
+├── docker-compose.yml                 # mariadb + api + front + phpmyadmin
+├── db/
+│   ├── init.sql                       # la BD completa, PROVISTA
+│   └── procedimientos_v2.sql          # ALTER de activo + los 5 sp_ del grupo
+│
+├── api_investigacion/                 # puerto [NECESITA ACLARACIÓN]
+│   ├── README.md                      # qué hay en cada carpeta
+│   ├── index.php                      # front controller: un bloque de rutas por recurso
+│   ├── modelos/
+│   │   ├── (los 6 de la v1)
+│   │   ├── Docente.php  Semillero.php
+│   │   ├── GrupoInvestigacion.php     # el ENCABEZADO
+│   │   └── ParticipaGrupo.php ...     # una clase por tabla puente (7)
+│   ├── controladores/                 # uno por recurso
+│   ├── servicios/
+│   │   ├── IServicio*.php  Servicio*.php      # un par por recurso
+│   │   └── ensamblador.php            # una función por recurso
+│   ├── repositorios/
+│   │   ├── IRepositorio*.php  Repositorio*MariaDB.php   # un par por recurso
+│   │   └── errores_de_integridad.php  ← LO NUEVO: traduce el veredicto del motor
+│   ├── excepciones/
+│   │   ├── NoEncontradoExcepcion.php            # de la v1
+│   │   └── ConflictoDeIntegridadExcepcion.php   ← LO NUEVO
+│   └── pruebas/
+│       └── prueba_capas.php           # servicios con repositorios falsos
+│
+├── front_investigacion/               # puerto [NECESITA ACLARACIÓN]
+│   ├── README.md
+│   ├── index.php                      # un bloque de pantallas por recurso
+│   ├── cliente_api.php                # una función por operación
+│   ├── vistas/
+│   │   ├── plantilla.php  inicio.php  no_encontrada.php
+│   │   ├── {recurso}_lista.php  {recurso}_formulario.php
+│   │   ├── puente_lista.php ...       # las puente: lista y asignar, sin editar
+│   │   └── grupos_detalle.php         ← la pantalla del maestro con sus semilleros
+│   └── publico/                       # Bootstrap guardado aquí, sin CDN
+│
+└── pruebas_humo/
+    └── humo_front.py                  # el recorrido desde la pantalla
 ```
 
-Los otros dos siguen el mismo patrón.
+`[NECESITA ACLARACIÓN: nombres exactos de las tablas y puertos. Unificar front_investigacion / front_php: en la v1 usé los dos.]`
 
-Puntos importantes:
+**Fíjese en el patrón:** las fichas simples (`docente`, `semillero` suelto)
+repiten las mismas piezas de la v1. Las tablas puente tienen las mismas
+carpetas con contenidos distintos: sin `PUT` ni `PATCH`. Y el grupo es el
+único recurso con **tres** diferencias: dos modelos que viajan juntos, sus
+repositorios llaman procedimientos, y su pantalla muestra el detalle.
 
-- El trigger de `UPDATE` es **imprescindible**: con borrado lógico, retirar un
-  grupo es un `UPDATE`, no un `DELETE`.
-- El trigger está sobre `grupo_investigacion` y modifica `universidad`. Si
-  modificara su propia tabla fallaría (error 1442).
-- Se comprueba **desde la pantalla**: se crea o retira un grupo y el contador
-  de la universidad cambia solo.
+## 3. Arquitectura en capas (el flujo no cambió)
 
-`[NECESITA ACLARACIÓN: nombre de la columna contador y de la FK universidad_id.]`
-
-## 6. Repositorios
-
-El repositorio es el único que hace `CALL`, siempre con parámetros `?`:
-
-```php
-$stmt = $this->pdo->prepare('CALL sp_consultar_docente(?)');
-$stmt->execute([$id]);
-$fila = $stmt->fetch(PDO::FETCH_ASSOC);
-$stmt->closeCursor();   // obligatorio, si no falla con el error 2014
+```text
+NAVEGADOR
+     → front_investigacion/index.php   (ruta → pantalla)
+     → cliente_api.php                 (única pieza que habla HTTP hacia afuera)
+     ↓  HTTP + JSON  — aquí termina un proceso y empieza otro
+     → api_investigacion/index.php     (método + ruta → controlador)
+     → Controlador{Recurso}            (valida la forma del body → 422)
+     → IServicio{Recurso}              (interfaz — reglas de negocio)
+     → IRepositorio{Recurso}           (interfaz — el servicio no sabe qué motor hay)
+     → Repositorio{Recurso}MariaDB     (PDO; en el grupo, CALL a procedimientos)
+     → MariaDB                         (llaves foráneas y procedimientos)
 ```
 
-Reglas:
+Lo que la v2 agrega es una flecha **de vuelta**: la base ya no solo guarda,
+también **dice que no**. Ese «no» sube por el repositorio, que lo traduce, y
+sale por el controlador como un `409`.
 
-- Nada de SQL armado concatenando texto.
-- `closeCursor()` después de cada `CALL` que devuelva filas.
-- Si la FK es opcional y llega como cadena vacía, se convierte a `null`
-  (con `(int) ''` daría `0`).
-- El repositorio captura el `PDOException` y lanza `ConflictoExcepcion`:
+Principios SOLID, para poder explicarlos en voz alta:
+
+| Principio | Dónde se ve |
+|---|---|
+| **S** — una sola responsabilidad | El controlador habla HTTP, el servicio aplica reglas, el repositorio habla con la base |
+| **O** — abierto a extender | Una tabla nueva es un juego nuevo de archivos; no se toca lo que ya funciona |
+| **L** — sustituibles | El repositorio falso de las pruebas reemplaza al de MariaDB sin que el servicio lo note |
+| **I** — interfaces pequeñas | Las tablas puente tienen una interfaz sin `actualizar` |
+| **D** — depender de abstracciones | El servicio recibe `IRepositorio...` por el constructor, nunca `new Repositorio...MariaDB` |
+
+## 4. Decisiones de diseño clave
+
+### 4.1 `errores_de_integridad.php`: dónde se traduce el «no» del motor
+
+Un archivo con una función, que vive en `repositorios/`:
 
 ```php
-catch (PDOException $e) {
-    $sqlstate = $e->errorInfo[0];   // '23000', '45000'...
-    $codigo   = $e->errorInfo[1];   // 1452, 1062, 1451...
+function traducirErrorDeIntegridad(PDOException $error, string $ficha): never
+{
+    // El regla propia (SIGNAL) se lee en [0]; los demás, en [1]
+    if (($error->errorInfo[0] ?? '') === '45000') { /* mensaje del procedimiento */ }
 
-    if ($sqlstate === '45000') {
-        throw new ConflictoExcepcion($e->errorInfo[2]);
-    }
-    if ($codigo === 1452) {
-        throw new ConflictoExcepcion('El registro relacionado no existe.');
-    }
-    if ($codigo === 1062) {
-        throw new ConflictoExcepcion('Ese registro ya existe.');
-    }
-    if ($codigo === 1451) {
-        throw new ConflictoExcepcion('No se puede borrar: otros registros dependen de este.');
-    }
-    throw $e;
+    $codigo = $error->errorInfo[1] ?? 0;
+    if ($codigo === 1062) { /* llave o pareja repetida     */ }
+    if ($codigo === 1452) { /* apunta a algo que no existe */ }
+    if ($codigo === 1451) { /* otros dependen de esto      */ }
+
+    throw $error;   // no lo reconozco: que se vuelva un 500
 }
 ```
 
-> [!NOTE]
-> `getCode()` de PDO no sirve para distinguir 1452, 1062 y 1451: los tres
-> llegan como `'23000'`. Por eso se usa `errorInfo[1]`. El `SIGNAL` se
-> identifica por `errorInfo[0] = '45000'`, no por el 1644.
+Los números 1062, 1452 y 1451 son de MariaDB. El repositorio es la única
+capa que tiene derecho a conocerlos, porque es la única que sabe qué motor
+hay detrás. Hacia arriba no sale un número: sale una
+`ConflictoDeIntegridadExcepcion` con el problema dicho en español.
 
-## 7. Servicios y controladores
+> **Detalle que conviene saber explicar:** `getCode()` de PDO devuelve
+> `'23000'` para 1452, 1062 y 1451 por igual, así que no sirve para
+> distinguirlos. El número que sirve está en `errorInfo[1]`. Y el `SIGNAL`
+> se lee al revés: su errno es siempre 1644, así que lo que lo identifica es
+> el SQLSTATE `'45000'` en `errorInfo[0]`.
 
-| Capa | Qué hace en la v2 |
-|---|---|
-| Servicio | Valida, aplica la regla de retiro y deja pasar `ConflictoExcepcion`. No conoce HTTP |
-| Controlador | Convierte `ConflictoExcepcion` en `409` |
+El 1451 casi no se dispara con borrado lógico (es un `UPDATE`), pero se sigue
+traduciendo por seguridad.
 
-Respuesta de ejemplo:
+### 4.2 Tres clases de recurso, tres tratamientos
+
+| Clase | Ejemplos | Acceso a datos | Verbos |
+|---|---|---|---|
+| **Ficha** | `docente`, `semillero` | SQL con parámetros `?` en el repositorio | `GET` lista, `GET` uno, `POST`, `PUT`, `PATCH`, `DELETE` |
+| **Puente** | `grupo_linea`, `ac_linea`... | SQL con parámetros `?` en el repositorio | `GET` lista, `POST`, `DELETE` con dos claves. `PUT`/`PATCH` → `405` |
+| **Maestro-detalle** | `grupo_investigacion` + `semillero` | **Procedimientos almacenados** | `GET`, `GET` uno, `POST`, `PUT`, `DELETE`. `PATCH` → `405` |
+
+El `405` sale del enrutador porque la ruta no está escrita: no hay que
+programar nada para que `PATCH` falle.
+
+### 4.3 El repositorio del grupo llama procedimientos, no escribe SQL
+
+Las fichas y las puente arman su `SELECT` y su `INSERT`. El repositorio del
+grupo **solo llama**:
+
+```php
+$sentencia = $this->conexion->prepare('CALL sp_crear_grupo_investigacion(?, ?, ?)');
+$sentencia->execute([$nombre, $universidad, json_encode($semilleros)]);
+
+$grupo = $sentencia->fetch(PDO::FETCH_ASSOC);   // primer resultado: el encabezado
+$sentencia->nextRowset();
+$detalle = $sentencia->fetchAll(PDO::FETCH_ASSOC);   // segundo: los semilleros
+
+$sentencia->closeCursor();   // IMPRESCINDIBLE: si no, la siguiente consulta da el error 2014
+```
+
+`[NECESITA ACLARACIÓN: parámetros reales del procedimiento, según las columnas del SQL oficial.]`
+
+**Cómo viaja el detalle.** Los semilleros llegan al procedimiento como **un
+solo parámetro JSON**, y el procedimiento los recorre con `JSON_TABLE`. Un
+procedimiento no puede recibir una lista, y mandar cinco `CALL` seguidos
+rompería el «todo o nada».
+
+**Cómo se garantiza el «todo o nada».** El procedimiento abre la transacción
+y la deshace si algo falla:
+
+```sql
+DELIMITER $$
+
+CREATE OR REPLACE PROCEDURE sp_crear_grupo_investigacion(
+    IN p_nombre      VARCHAR(100),
+    IN p_universidad INT,
+    IN p_detalle     LONGTEXT          -- JSON con los semilleros
+)
+BEGIN
+    DECLARE v_id INT;
+
+    -- si CUALQUIER cosa falla: se deshace todo y el error sube igual
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        RESIGNAL;
+    END;
+
+    START TRANSACTION;
+
+    INSERT INTO grupo_investigacion (nombre, universidad)
+    VALUES (p_nombre, p_universidad);
+    SET v_id = LAST_INSERT_ID();       -- ANTES de otra sentencia
+
+    INSERT INTO semillero (nombre, grupo)
+    SELECT j.nombre, v_id
+    FROM JSON_TABLE(p_detalle, '$[*]' COLUMNS (nombre VARCHAR(100) PATH '$.nombre')) AS j;
+
+    COMMIT;
+
+    -- MariaDB no tiene RETURNING: se devuelve lo que quedó guardado
+    SELECT * FROM grupo_investigacion WHERE id = v_id;
+    SELECT * FROM semillero WHERE grupo = v_id AND activo = 1;
+END$$
+
+DELIMITER ;
+```
+
+Es un esquema para entender la forma, no el código final: las columnas son
+ilustrativas.
+
+### 4.4 Distinguir «no existe» de «no se deja»
+
+Los rechazos de un procedimiento llegan con `SIGNAL`, y no significan lo
+mismo:
+
+- «El grupo no existe» → debe ser **404**.
+- «Primero retire los semilleros de este grupo» → debe ser **409**.
+
+El ejemplo de clase los separa mirando el **texto** del mensaje, y lo declara
+como una fragilidad. Aquí se evita con un dato más fiable: cada caso lleva su
+propio SQLSTATE.
+
+| Caso | SQLSTATE del `SIGNAL` | Respuesta |
+|---|---|---|
+| Regla de negocio rota | `'45000'` | `409` con el texto del mensaje |
+| No existe o está retirado | `'45001'` | `404` |
+
+`[NECESITA ACLARACIÓN: confirmar con el profesor que se puede usar '45001'. La guía solo nombra '45000'. Si no, se separa por el texto, como en el ejemplo, y se declara como fragilidad.]`
+
+### 4.5 El controlador del grupo valida dos niveles
+
+El body del grupo trae una lista adentro:
 
 ```json
-{
-    "estado": 409,
-    "mensaje": "Conflicto de integridad.",
-    "detalle": "Primero retire los semilleros de este grupo."
-}
+{ "nombre": "Grupo de IA", "universidad": 1,
+  "detalle": [ {"nombre": "Semillero de visión"},
+               {"nombre": "Semillero de lenguaje"} ] }
 ```
 
-Tabla de errores de la v2:
+Validar eso es validar que `detalle` sea una lista **y** que cada renglón
+traiga sus campos con el tipo correcto. El error dice **cuál** renglón y por
+qué, y se numeran desde 1: el renglón 0 no existe para quien mira la pantalla.
 
-| Situación | Código |
-|---|---|
-| FK inexistente (1452) | `409` |
-| Pareja o registro repetido (1062) | `409` |
-| Borrar con dependientes (1451) | `409` |
-| Regla del procedimiento (`'45000'`) | `409` |
-| El resto (validación, no existe, etc.) | Igual que en la v1: `400`, `404`, `405`, `422` |
+### 4.6 La regla de retiro vive en dos sitios
 
-El usuario **nunca** ve el SQL ni el nombre de la tabla en un error.
+Con borrado lógico, retirar un grupo es un `UPDATE`, y la llave foránea no se
+entera. Por eso hay dos defensas a distinta altura:
 
-## 8. Rutas
+1. **El procedimiento** `sp_eliminar_grupo_investigacion` revisa si hay
+   semilleros activos y lanza el `SIGNAL`. Protege a la base de cualquier
+   programa que le escriba sin pasar por la API.
+2. **El servicio** aplica la misma regla en PHP, para dar el mensaje antes.
+   `[NECESITA ACLARACIÓN: confirmar con el profesor si se quiere esta doble defensa o solo la del procedimiento.]`
 
-**Tablas maestras** (mismo patrón de la v1):
+### 4.7 Las tablas puente
 
-```http
-GET    /api/docente
-GET    /api/docente/{id}
-POST   /api/docente
-PUT    /api/docente/{id}
-PATCH  /api/docente/{id}
-DELETE /api/docente/{id}
-```
-
-**Tablas puente:** se asignan y se retiran, no se editan.
-
-```http
-GET    /api/grupo_linea
-POST   /api/grupo_linea
-DELETE /api/grupo_linea/{clave1}/{clave2}
-```
-
-- Repetir una pareja → `409`.
+- La llave es compuesta: las dos llaves foráneas juntas.
+- La ruta lleva las dos claves: `DELETE /api/grupo_linea/{clave1}/{clave2}`.
+- Repetir una pareja da el 1062 → `409`.
 - Retirar una pareja que no existe → `404`.
-- `405` si se intenta `PUT` o `PATCH`.
+- La interfaz del repositorio **no tiene** `actualizar`: una pareja existe o
+  no existe.
+- En la pantalla no hay botón de editar.
 
-`[NECESITA ACLARACIÓN: columnas reales de cada tabla puente.]`
+`[NECESITA ACLARACIÓN: ¿llevan activo o se borran físicamente? Cambia el repositorio: UPDATE o DELETE.]`
 
-## 9. Frontend
+### 4.8 `activo`: el `ALTER` de la v2
 
-### 9.1 Desplegables
+Las tablas del módulo no traen `activo`; solo `rol` y `usuario` lo tienen. Si
+no se agregó en la v1, se agrega ahora en `procedimientos_v2.sql`:
 
-- Cada FK es un `<select>` que **muestra el nombre y manda la clave**.
-- Se llena con una llamada a la API (`cliente_api.php`), solo con `activo = 1`.
-- Si la FK es opcional, la primera opción es **«(ninguna)»** y manda `null`.
+```sql
+ALTER TABLE docente ADD COLUMN IF NOT EXISTS activo TINYINT(1) NOT NULL DEFAULT 1;
+```
+
+`ADD COLUMN IF NOT EXISTS` es de MariaDB y permite correr el script varias
+veces. La razón se escribe en `5_data_model.md`.
+
+### 4.9 `ensamblador.php`: una función por recurso, no un `switch`
+
+Una función por recurso (`crearServicioDocente()`, `crearServicioGrupo()`...),
+y no una sola con un `switch` ni nombres de clase armados con texto:
+
+- con funciones separadas, PHP verifica los tipos y el error sale al llamarlas;
+- con nombres armados en texto, el error sale en producción, cuando alguien
+  pida el recurso que nadie probó;
+- quien lea el archivo ve el inventario completo sin ejecutar nada.
+
+### 4.10 El front: un bloque por recurso y una excepción
+
+`front_investigacion/index.php` repite un bloque de rutas por recurso. Es
+largo, pero cada bloque se lee solo. La prueba de que repetir era correcto: el
+bloque del grupo **no se parece a los demás**. No tiene «guardar solo lo que
+cambié», y tiene una pantalla que muestra el detalle. Una tabla de
+configuración habría tenido que crecer con excepciones hasta volverse ilegible.
+
+### 4.11 Desplegables y llaves foráneas
+
+Los formularios con llave foránea ofrecen un `<select>`. Cuesta una petición
+más a la API por cada desplegable, y las vale.
+
+- Muestra el **nombre** y manda la **clave**.
+- Solo ofrece registros **activos**, porque el listado del que sale ya filtra.
+- Si la llave es opcional, la primera opción es **«(ninguna)»** y se convierte
+  a `null` a mano: un `<select>` vacío llega como cadena vacía, y `(int) ''`
+  vale `0`.
 - Todo texto que viene de la base se imprime con `htmlspecialchars`.
+- La respuesta `204` (tabla vacía) no trae JSON: `json_decode('')` da `null`,
+  y hay que tratarlo antes de recorrerlo.
 
-### 9.2 Maestro-Detalle
+**Lo que el desplegable NO hace es validar.** La lista pudo cargarse hace un
+minuto y esa ficha pudo borrarse entretanto. Quien defiende la integridad es
+la base.
 
-- La pantalla del maestro muestra su detalle y permite agregar renglones sin
-  salir de ella.
-- Varios renglones viajan en **un solo envío**, con campos `detalle_xxx[]` que
-  llegan como arreglos paralelos.
-- El repositorio los guarda dentro de una **transacción** (`beginTransaction`,
-  `commit` y `rollback`): si una parte falla, no se guarda nada.
+### 4.12 Detalle en un solo envío
 
-`[NECESITA ACLARACIÓN: confirmar los maestro-detalle (universidad → grupo, grupo → semillero, línea → docente) con la guía de la v2.]`
+El formulario del grupo ofrece **cinco renglones fijos**, con campos
+`detalle_nombre[]` que llegan a PHP como arreglos paralelos. El front los
+recorre a la vez, descarta los vacíos y los manda como una lista en un solo
+`POST`. Es una limitación de la pantalla, no de la API.
 
-### 9.3 Mensajes
+### 4.13 Interpretabilidad
 
-- Un `409` se muestra como mensaje claro en castellano.
-- La tabla vacía (`204`) se muestra como «todavía no hay datos».
-- La interfaz no usa las palabras «PUT», «PATCH», «422» ni «FK».
-- Si hay un error, **no se pierde lo que la persona escribió**.
+Quien entra a la carpeta debe saber qué hay y qué hace cada cosa:
 
-## 10. Pruebas
+- Un `README.md` por carpeta principal, con una frase por archivo.
+- Un comentario de apertura en cada archivo PHP: qué es y qué NO hace.
+- Nombres que dicen lo que hacen (`ControladorGrupoInvestigacion`, no `Ctrl1`).
+- Los documentos del spec kit dicen lo mismo que el código.
 
-**Prueba de capas** (`pruebas/prueba_capas_v2.php`), sin base de datos:
+## 5. Docker: los mismos cuatro servicios
 
-- Un repositorio falso en memoria que lanza `ConflictoExcepcion`.
-- El servicio deja pasar el conflicto.
-- Retirar un maestro con hijos activos es rechazado.
+```yaml
+services:
+  mariadb:                 # mariadb:11 + db/init.sql + procedimientos_v2.sql · healthcheck
+  api-investigacion:       # build ./api_investigacion · DB_DSN → mariadb:3306
+  front-investigacion:     # build ./front_investigacion · URL_API → http://api-investigacion:...
+                           #   sin credenciales de la base, sin depends_on de mariadb
+  phpmyadmin:
+volumes:
+  mariadbdata:
+```
 
-**Pruebas por HTTP**, incluidas las que **deben fallar**:
+`[NECESITA ACLARACIÓN: puertos de esta versión. Deben ser distintos a los de la v1 para poder tener las dos encendidas y compararlas.]`
 
-- [ ] CRUD de cada tabla maestra.
-- [ ] Asignar, repetir (`409`) y retirar en cada tabla puente.
-- [ ] FK inexistente → `409`.
-- [ ] Retirar un grupo con semilleros activos → `409`.
-- [ ] Maestro-detalle con un renglón inválido → no se guarda nada.
-- [ ] Tabla vacía → `204`.
-- [ ] Trigger: crear y retirar un grupo cambia el contador de la universidad.
+Las variables de entorno son las mismas de la v1: `DB_HOST`, `DB_PORT`,
+`DB_DATABASE`, `DB_USERNAME` y `DB_PASSWORD`.
 
-**Regresión:** todos los criterios de la v1 siguen en verde.
+## 6. Convenciones
 
-## 11. Orden de trabajo
+Las de la constitución: todo en español, comentario de apertura por archivo,
+clases PascalCase (prefijo `I` en interfaces), métodos y variables camelCase,
+un archivo por clase y `declare(strict_types=1)` en todo archivo PHP.
 
-1. Confirmar tablas y columnas con el SQL oficial.
-2. Escribir
+## 7. Chequeo de constitución
+
+> **La compuerta 2** del método: antes de pasar a `8_tasks.md` se revisa la
+> constitución **artículo por artículo**.
+
+> [!WARNING]
+> Todavía no he visto `1_constitution.md`. Los nombres de los artículos salen
+> del ejemplo de clase. Hay que contrastarlos con el archivo real antes de dar
+> esta tabla por buena.
+
+| Artículo | Cómo lo cumple esta versión |
+|---|---|
+| **1** — Propósito didáctico | Todo en español y comentado; explícito y repetitivo antes que compacto (§4.10) |
+| **1.1** — Una versión incluye su front | Cada recurso nuevo entrega su pantalla, incluida la del grupo con su detalle |
+| **2** — PHP puro | Sin framework, sin Composer. Bootstrap es un archivo copiado |
+| **3** — Tres capas estrictas | El front no recibe credenciales ni depende de la base |
+| **4** — Un solo comando | `docker compose up -d --build` deja los cuatro servicios funcionando |
+| **5** — Independencia del motor | El dialecto (`CALL`, 1062, 1452, 1451, `'45000'`) vive solo en las clases `*MariaDB` y en `errores_de_integridad.php` |
+| **6** — Persistencia | Volúmenes; `down -v` devuelve la base a su estado original |
+| **7** — Recarga natural | PHP reinterpreta cada petición |
+| **8** — Convenciones fijas | Sobre de respuesta y catálogo de errores, con el `409` agregado |
+| **9** — Seguridad académica | Credenciales en `.env`; todo lo que el front pinta pasa por `htmlspecialchars` |
+| **10** — API específica | Una ruta escrita por recurso; la prueba: las puente y el grupo no admiten `PATCH` y ninguna ruta genérica podría decirlo |
+| **11** —
