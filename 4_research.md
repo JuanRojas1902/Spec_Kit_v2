@@ -1,253 +1,293 @@
-# Investigación y decisiones — v2
+# Investigación y decisiones — Versión 2
 
-Aquí se anotan las decisiones que tomamos en la v2 y por qué. Lo que se
-descubrió investigando está marcado como **Hallazgo**.
+> **Versión 2** · **Lectura opcional** (el porqué de las decisiones del plan,
+> con las alternativas que se evaluaron y descartaron). Complementa a
+> [3_plan.md](3_plan.md); el orden de trabajo está en [8_tasks.md](8_tasks.md).
 
 > **Estado:** borrador. Los `[NECESITA ACLARACIÓN]` se resuelven con el SQL
-> oficial antes de programar.
+> oficial y con el profesor antes de programar.
 
-## Resumen de decisiones
+---
 
-| # | Decisión | Por qué |
-|---|---|---|
-| 1 | Todo el CRUD por **procedimientos almacenados** (`CALL sp_...`) | Cero SQL escrito a mano en PHP |
-| 2 | **3 triggers** separados que llaman a un solo procedimiento | MariaDB no permite varios eventos en un trigger |
-| 3 | Distinguir errores con **`errorInfo[1]`** | PDO da el mismo `23000` para tres errores distintos |
-| 4 | Reglas propias con **`SIGNAL SQLSTATE '45000'`** | Permite rechazar con un mensaje claro |
-| 5 | **No se retira** un maestro con detalle activo | Evita hijos huérfanos con el borrado lógico |
-| 6 | Errores de integridad responden **`409`**, nunca `500` | Son un conflicto, no una falla del servidor |
-| 7 | `closeCursor()` después de cada `CALL` | Si no, falla con el error 2014 |
-| 8 | Scripts con **`CREATE OR REPLACE`** | Se pueden correr varias veces |
-| 9 | Un solo **`sp_actualizar`** para `PUT` y `PATCH` | Menos procedimientos; el servicio mezcla los datos |
-| 10 | Cada FK es un **`<select>`** cargado desde la API | Cero llaves foráneas digitadas |
-| 11 | FK opcional: opción **«(ninguna)»** que manda `null` | `(int) ''` daría `0` |
-| 12 | Maestro-detalle en **un solo envío** con transacción | Todo o nada |
-| 13 | Tablas puente: se **asignan y retiran**, no se editan | Una pareja existe o no existe |
-| 14 | La v2 **incluye la v1** (regresión) | Lo que ya funcionaba debe seguir funcionando |
+## D1 — El rechazo del motor sale como 409, no como 500
 
-## Detalles de cada decisión
+**Alternativas descartadas:** dejarlo como 500 (lo que hace la v1) o
+convertirlo en 400.
+**Decisión:** **409 Conflicto**, con el motivo en español.
+**Por qué:**
 
-### Triggers en MariaDB (decisiones 2)
+En la v1 el 500 estaba bien decidido: la integridad no era tema de esa
+versión y traducirla habría sido lógica que nadie pidió. En la v2 la
+integridad **es** el tema, así que la balanza cambia. Los tres códigos dicen
+cosas distintas:
 
-**Hallazgo:** MariaDB no soporta varios eventos en un solo trigger (como sí
-hace PostgreSQL). Un trigger atiende un único evento.
-
-**Decisión:** para contar los grupos por universidad se crean **3 triggers**
-que llaman al mismo procedimiento:
-
-| Trigger | Evento | Qué hace |
-|---|---|---|
-| `trg_grupo_ai` | `AFTER INSERT` | Recuenta la universidad del grupo nuevo |
-| `trg_grupo_au` | `AFTER UPDATE` | Recuenta la universidad nueva y la anterior |
-| `trg_grupo_ad` | `AFTER DELETE` | Recuenta la universidad del grupo borrado |
-
-El procedimiento común es `sp_recontar_grupos`.
-
-**Alternativas descartadas:**
-
-- Un solo trigger para los tres eventos: MariaDB no lo permite.
-- Calcular el total en cada consulta con `COUNT(*)`: no sería un trigger, y la
-  rúbrica pide al menos uno.
-
-**Puntos importantes:**
-
-- El trigger de `UPDATE` es **imprescindible**: con borrado lógico, retirar un
-  grupo es un `UPDATE`, no un `DELETE`.
-- El trigger está en `grupo_investigacion` y modifica `universidad`. Si
-  modificara su propia tabla fallaría (error 1442).
-- Se comprueba **desde la pantalla**: se crea o retira un grupo y el contador
-  cambia solo.
-
-`[NECESITA ACLARACIÓN: nombre de la columna contador en universidad y de la FK universidad_id.]`
-
-### Errores de integridad (decisión 3)
-
-**Hallazgo:** PDO devuelve el mismo `SQLSTATE` (`23000`) para tres casos
-distintos, así que `getCode()` no sirve para distinguirlos:
-
-| Qué pasa | `errorInfo[0]` | `errorInfo[1]` |
-|---|---|---|
-| FK inexistente | `23000` | `1452` |
-| Registro o pareja repetida | `23000` | `1062` |
-| Borrado físico bloqueado | `23000` | `1451` |
-
-**Decisión:** se distingue leyendo el código propio del driver en
-`$e->errorInfo[1]`.
-
-```php
-catch (PDOException $e) {
-    $codigo = $e->errorInfo[1];
-
-    if ($codigo === 1452) { /* la FK no existe */ }
-    if ($codigo === 1062) { /* repetido */ }
-    if ($codigo === 1451) { /* hay dependientes */ }
-}
-```
-
-### Reglas propias con `SIGNAL` (decisión 4)
-
-Para rechazar una operación con un mensaje propio, el procedimiento lanza:
-
-```sql
-SIGNAL SQLSTATE '45000'
-    SET MESSAGE_TEXT = 'Primero retire los semilleros de este grupo.';
-```
-
-**Hallazgo:** este error se lee al revés que los anteriores. Aquí **no** se
-mira `errorInfo[1]`, sino el índice `[0]`:
-
-| Índice | Qué trae en un `SIGNAL` |
+| | Qué le comunica al que llama |
 |---|---|
-| `errorInfo[0]` | `'45000'`, que es la señal |
-| `errorInfo[1]` | `1644` (código de MariaDB para una señal propia) |
-| `errorInfo[2]` | El texto de `MESSAGE_TEXT` |
+| **500** | «Se nos dañó algo». Es mentira: el sistema funcionó bien |
+| **400** | «Su petición está mal escrita». También es mentira: estaba bien escrita |
+| **409** | «Su petición está bien, pero no cabe en los datos que hay» |
 
-El spec dice «interceptar 1644», pero en PHP se detecta por
-`errorInfo[0] === '45000'`, y el mensaje que ve el usuario sale de
-`errorInfo[2]`.
+La diferencia se nota en la pantalla: con 500 la persona lee «error interno»;
+con 409 lee «primero retire los semilleros de este grupo» y sabe qué hacer.
 
-```php
-if ($e->errorInfo[0] === '45000') {
-    throw new ConflictoExcepcion($e->errorInfo[2]);
-}
-```
+**Precio asumido:** hay que reconocer códigos del motor, y eso ata un archivo
+a MariaDB. Se paga aislándolo en `errores_de_integridad.php`.
 
-### No retirar un maestro con detalle activo (decisión 5)
+## D2 — No se pregunta antes: se intenta y se traduce el veredicto
 
-**Pregunta (Compuerta 1):** con borrado lógico, ¿se puede retirar un maestro
-que todavía tiene detalle activo?
+**Alternativa descartada:** que el servicio comprobara primero («¿existe el
+grupo 5?») y solo entonces insertara.
+**Decisión:** intentar la escritura y traducir el «no» del motor.
+**Por qué:**
 
-**Decisión: NO.**
+1. **La comprobación previa no evita el problema, lo hace más raro.** Entre
+   el `SELECT` y el `INSERT`, otra persona puede retirar ese grupo. Un error
+   que falla siempre se arregla; uno que falla a veces se vuelve leyenda.
+2. **Duplica una regla que ya está en la base.** La llave foránea vive allí.
+   Repetirla en PHP es mantener el mismo negocio en dos idiomas.
 
-- El procedimiento de retiro revisa si hay hijos activos.
-- Si los hay, lanza `SIGNAL SQLSTATE '45000'`.
-- La API responde `409`.
+**Precio asumido:** el mensaje sale del código del motor, no del caso
+concreto, así que es más general («alguno de los códigos a los que apunta no
+existe», sin decir cuál).
 
-**Por qué:** con `DELETE FROM`, la base protegía los hijos con la llave
-foránea (error 1451). Con borrado lógico solo se hace un `UPDATE`, y la FK no
-se entera: quedarían semilleros activos de un grupo retirado. El
-procedimiento hace ese trabajo.
+## D3 — Un solo maestro-detalle: `grupo_investigacion → semillero`
 
-**Alternativas descartadas:**
+**Alternativas descartadas:** `universidad → grupo_investigacion`,
+`linea_investigacion → docente`, o hacer los tres.
+**Decisión:** se hace **uno**, completo.
+**Por qué:**
 
-- Retirar también los hijos en cascada: la persona podría perder datos sin
-  querer.
-- Dejar los hijos huérfanos: los listados mostrarían datos incoherentes.
+- La guía de la v2 lo pide así: un maestro-detalle bien hecho enseña todo lo
+  que hay que aprender; tres a medias enseñan lo mismo, peor hecho.
+- Un semillero **no existe sin su grupo**, que es justo lo que define a un
+  detalle. `linea_investigacion → docente` es más débil: un docente existe
+  por sí solo.
+- `universidad → grupo_investigacion` sirve, pero la universidad ya viene de
+  la v1 y su pantalla tendría que cambiar. Escoger el grupo deja la v1 intacta.
 
-Una fila de tabla puente sí se puede retirar sola.
+**Precio asumido:** los otros dos quedan como CRUD corriente, sin pantalla de
+maestro con detalle.
 
-> [!NOTE]
-> El error 1451 solo aparece con borrado físico. Con el borrado lógico de la
-> v2 casi nunca se dispara, pero se sigue capturando por seguridad.
+`[NECESITA ACLARACIÓN: confirmar con el SQL que semillero tiene una FK al grupo.]`
 
-### `409 Conflict` y no `500` (decisión 6)
+## D4 — Procedimientos almacenados solo en el maestro-detalle
 
-Un error de integridad no es una falla del servidor, es un conflicto con los
-datos que ya existen. Por eso responde `409`.
+**Alternativa descartada:** procedimientos en las 10 tablas, que era lo que
+mis borradores anteriores proponían.
+**Decisión:** los cinco verbos del grupo (`sp_listar_`, `sp_consultar_`,
+`sp_crear_`, `sp_actualizar_`, `sp_eliminar_`) van por procedimientos. El resto
+usa SQL preparado en el repositorio, como en la v1.
+**Por qué:** el procedimiento gana algo de verdad donde hay varias
+escrituras: **recibe el detalle completo y lo guarda en una transacción**. Un
+CRUD de una sola tabla no gana nada con un procedimiento; se escribe igual de
+bien con una sentencia preparada.
 
-| Situación | Código |
-|---|---|
-| FK inexistente (1452) | `409` |
-| Repetido (1062) | `409` |
-| Borrado con dependientes (1451) | `409` |
-| Regla del procedimiento (`'45000'`) | `409` |
-| Lo demás (validación, no existe, etc.) | Igual que en la v1: `400`, `404`, `405`, `422` |
+**Precio asumido:** el proyecto tiene dos estilos de repositorio. Se compensa
+con que el patrón es siempre el mismo: la interfaz no cambia, solo lo que hay
+dentro de la clase `*MariaDB`.
 
-Flujo: el repositorio captura `PDOException` → lanza `ConflictoExcepcion` → el
-controlador responde `409`. El usuario nunca ve SQL ni nombres de tablas.
+## D5 — El detalle viaja como un parámetro JSON
 
-### Procedimientos almacenados (decisiones 1, 7, 8 y 9)
+**Alternativas descartadas:** varios `CALL` seguidos (uno por semillero) o un
+parámetro por cada semillero.
+**Decisión:** el repositorio manda los semilleros como **un solo texto JSON**
+y el procedimiento los recorre con `JSON_TABLE`.
+**Por qué:**
 
-- Cinco por tabla: `sp_listar_<tabla>`, `sp_consultar_<tabla>`,
-  `sp_crear_<tabla>`, `sp_actualizar_<tabla>` y `sp_eliminar_<tabla>`.
-- Se escriben con `DELIMITER $$` y `CREATE OR REPLACE PROCEDURE`, para poder
-  correr el script otra vez sin borrar nada a mano.
-- **Hallazgo:** MariaDB no tiene `RETURNING`, así que `sp_crear_*` devuelve la
-  fila con un `SELECT` final. Si la llave es `AUTO_INCREMENT`, se guarda
-  `LAST_INSERT_ID()` en una variable antes de otra sentencia.
-- **Hallazgo:** después de un `CALL` que devuelve filas hay que llamar
-  `$stmt->closeCursor()`. Si no, la siguiente consulta falla con el error
-  2014.
-- `PUT` y `PATCH` usan el mismo `sp_actualizar`: el servicio lee el registro
-  actual, mezcla los campos enviados y llama al procedimiento con todos.
+- Un procedimiento no puede recibir una lista.
+- Varios `CALL` rompen el «todo o nada»: si falla el tercero, quedan dos
+  guardados.
+- Un parámetro por semillero fija cuántos caben (y la pantalla ya limita a
+  cinco; no hay que limitar también la API).
 
-### Desplegables y FK opcionales (decisiones 10 y 11)
+**Cómo se garantiza el «todo o nada»:** el procedimiento abre la transacción y
+tiene un `EXIT HANDLER FOR SQLEXCEPTION` que hace `ROLLBACK` y `RESIGNAL`.
 
-- El `<select>` **muestra el nombre y manda la clave**.
-- Solo ofrece registros con `activo = 1`.
-- Si la FK es opcional, la primera opción es **«(ninguna)»** y llega como
-  cadena vacía.
-- **Hallazgo:** `(int) ''` vale `0`, y `0` no es «sin valor»: la base
-  rechazaría esa FK. Hay que convertir `''` a `null` explícitamente.
+**Precio asumido:** `JSON_TABLE` pide MariaDB 10.6 o superior (la imagen
+`mariadb:11` lo cumple), y es una solución mía que el ejemplo de clase no usa.
+`[NECESITA ACLARACIÓN: confirmar con el profesor si acepta JSON_TABLE.]`
 
-```php
-$grupoId = ($_POST['grupo_id'] ?? '') === '' ? null : (int) $_POST['grupo_id'];
-```
+## D6 — El SIGNAL se lee al revés, y «no existe» tiene su propio SQLSTATE
 
-- Todo texto que viene de la base se imprime con `htmlspecialchars`.
+**Hallazgo 1.** El `getCode()` de PDO devuelve `'23000'` para 1452, 1062 y
+1451 por igual, así que con eso no se distingue un padre inexistente de una
+pareja repetida. El número que sirve está en `errorInfo[1]`.
 
-### Maestro-detalle (decisión 12)
+**Hallazgo 2.** Un `SIGNAL` propio llega con el errno genérico 1644, y lo que
+lo identifica es el SQLSTATE `'45000'` en `errorInfo[0]`. Si solo se mira el
+`[1]`, las reglas que uno mismo escribió en el procedimiento acaban en el 500.
 
-- La pantalla del maestro muestra su detalle y permite agregar renglones sin
-  salir de ella.
-- Varios renglones viajan en **un solo envío**, con campos `detalle_xxx[]`
-  que llegan a PHP como arreglos paralelos.
-- El repositorio los guarda dentro de una transacción:
+| Qué pasa | Dónde se lee | Respuesta |
+|---|---|---|
+| Llave o pareja repetida | `errorInfo[1] = 1062` | `409` |
+| Apunta a algo que no existe | `errorInfo[1] = 1452` | `409` |
+| Otros dependen de esto (borrado físico) | `errorInfo[1] = 1451` | `409` |
+| Regla propia del procedimiento | `errorInfo[0] = '45000'` | `409` con el mensaje del `SIGNAL` |
+| El grupo no existe o está retirado | `errorInfo[0] = '45001'` | `404` |
 
-```php
-$this->pdo->beginTransaction();
-try {
-    // CALL sp_crear_... por cada renglón
-    $this->pdo->commit();
-} catch (PDOException $e) {
-    $this->pdo->rollBack();
-    throw $e;
-}
-```
+**Alternativa descartada:** distinguir «no existe» de «no se deja» leyendo el
+**texto** del mensaje. Es frágil: si alguien reescribe el procedimiento con
+otras palabras, deja de funcionar.
+**Decisión:** un SQLSTATE aparte (`'45001'`) para «no existe».
+**Precio asumido:** la guía solo nombra `'45000'`, así que `'45001'` es una
+decisión mía. Está aislada en `errores_de_integridad.php`; si el profesor no
+la acepta, se cambia ahí por la lectura del texto, declarándolo como
+fragilidad.
 
-Si un renglón falla, **no se guarda ninguno**.
+El 1451 casi no se dispara con borrado lógico (es un `UPDATE`), pero se sigue
+traduciendo por seguridad.
 
-`[NECESITA ACLARACIÓN: confirmar los maestro-detalle (universidad → grupo, grupo → semillero, línea → docente) con la guía de la v2.]`
+## D7 — No se retira un grupo que tiene semilleros activos
 
-### Tablas puente (decisión 13)
+**Alternativas descartadas:** retirar también los semilleros en cascada, o
+dejarlos huérfanos.
+**Decisión:** **se rechaza con 409**: «Primero retire los semilleros de este
+grupo».
+**Por qué:** con `DELETE FROM`, la base protegía a los hijos con la llave
+foránea (error 1451). Con borrado lógico solo hay un `UPDATE`, y la llave
+foránea no se entera. Sin una regla propia quedarían semilleros activos de un
+grupo retirado, y los listados mostrarían datos incoherentes. La cascada
+descartada es peor: la persona perdería datos sin quererlo.
 
-- Su llave es compuesta (dos claves foráneas).
-- Se **asignan** (`POST`) y se **retiran** (`DELETE` con las dos claves). No
-  llevan botón de editar, porque cambiar una pareja es retirar una y asignar
-  otra.
-- Repetir una pareja → `409` (error 1062).
+**Dónde vive la regla:** en dos sitios, a distinta altura.
+
+1. **El procedimiento** `sp_eliminar_grupo_investigacion` revisa y lanza el
+   `SIGNAL`. Protege a la base de cualquier programa que escriba sin pasar
+   por la API.
+2. **El servicio** la aplica también, para dar el mensaje antes.
+
+**Precio asumido:** la misma regla en dos idiomas, que es lo que D2 critica.
+La diferencia es que aquí la regla de negocio **no** la sabe la llave
+foránea, así que alguien tiene que decirla. `[NECESITA ACLARACIÓN: confirmar si se quiere la doble defensa o solo la del procedimiento.]`
+
+## D8 — El grupo no tiene PATCH: se reemplaza entero
+
+**Alternativa descartada:** darle a `IRepositorioGrupoInvestigacion` los mismos
+métodos que a las demás fichas.
+**Decisión:** `PUT` reemplaza el encabezado y **todo** el detalle; los
+semilleros que ya no vienen quedan en `activo = 0`. Un `PATCH` responde 405.
+**Por qué:** cambiar un semillero toca lo que el grupo contiene, y un «cambiar
+solo un pedacito» del detalle deja dudas: ¿los que no menciono se quedan o se
+borran? Con `PUT` la respuesta es una sola.
+
+El 405 sale del enrutador, porque la ruta no está escrita. No hay que
+programar nada para que `PATCH` falle.
+
+**Esto demuestra por qué la API es específica:** una ruta genérica
+`/api/{tabla}` habría dado `PATCH` al grupo por tener las mismas operaciones
+que todas.
+
+`[NECESITA ACLARACIÓN: ¿se necesita DELETE propio del semillero suelto, o basta retirarlo con el PUT del grupo?]`
+
+## D9 — Las tablas puente se asignan y se retiran, no se editan
+
+**Alternativa descartada:** darles `PUT` y `PATCH` como a cualquier ficha.
+**Decisión:** `GET` lista, `POST` asigna, `DELETE` con las dos claves retira.
+`PUT` y `PATCH` responden 405, y la pantalla no tiene botón de editar.
+**Por qué:** su llave **es** la pareja. Cambiar un lado es otra pareja:
+retirar una y asignar otra. Editar no tiene sentido.
+
+- Repetir una pareja da el 1062 → `409`.
 - Retirar una pareja que no existe → `404`.
-- `PUT` o `PATCH` → `405`.
+- La interfaz del repositorio **no tiene** `actualizar`. Es el principio de
+  segregación de interfaces (la «I» de SOLID): no obligar a una clase a
+  implementar lo que no hace.
 
-`[NECESITA ACLARACIÓN: ¿las tablas puente llevan activo o se borran físicamente?]`
+`[NECESITA ACLARACIÓN: ¿las tablas puente llevan activo o se borran físicamente? Cambia el repositorio (UPDATE o DELETE) y el 404 de retirar.]`
 
-### Regresión de la v1 (decisión 14)
+## D10 — Los desplegables muestran nombres y mandan claves
 
-La v2 **incluye** la v1. Los criterios de la v1 deben seguir en verde:
-`PUT` exige todo, `PATCH` vacío da `400`, el segundo `DELETE` da `404`, y los
-registros retirados no salen en los listados.
+**Alternativa descartada:** una casilla de texto donde se teclea el código.
+**Decisión:** un `<select>` cargado desde la API.
+**Por qué:** teclear un código que hay que ir a buscar a otra pantalla es de
+las cosas que hacen odiar un sistema. Cuesta una petición más por
+desplegable, y las vale.
 
-## Alternativas consideradas (resumen)
+Detalles de PHP que costaron una corrida cada uno:
 
-| Tema | Elegida | Descartadas |
-|---|---|---|
-| Acceso a datos | Procedimientos almacenados | SQL directo en PHP |
-| Contador de grupos | 3 triggers | `COUNT(*)` en cada consulta |
-| Detectar el error | `errorInfo[1]` y `errorInfo[0]` | `getCode()` |
-| Retiro con hijos | Bloquear con `SIGNAL` | Cascada; dejar huérfanos |
-| FK en pantalla | `<select>` | Campo de texto |
-| Detalle | Un envío con transacción | Un envío por renglón |
+- **Solo ofrece activos**, porque el listado del que sale ya filtra. Ofrecer
+  un padre retirado es ofrecer una opción que la base va a rechazar.
+- **«(ninguna)» manda `null`.** Un `<select>` vacío llega como cadena vacía, y
+  `(int) ''` vale `0`, que no es `null`. La base lo rechaza buscando el
+  registro 0.
+- **`htmlspecialchars` en todo lo que viene de la base.** Un apellido con
+  apóstrofo o con un `<` rompe el HTML sin dar ningún error.
+- **El `204` no trae JSON.** `json_decode('')` da `null` y el `foreach`
+  revienta en PHP 8.
 
-## Pendientes por confirmar
+**Lo que el desplegable NO hace es validar.** La lista pudo cargarse hace un
+minuto y esa ficha pudo retirarse; y cualquiera puede mandar un `POST` sin
+pasar por la pantalla. Quien defiende la integridad es la base. Confundir «la
+pantalla no deja escoger eso» con «eso no puede pasar» es uno de los errores
+más caros del software.
 
-- [ ] Numeración de versiones: el mapa del repositorio pone las tablas sin FK
-      en la v2 y las que tienen FK en la v3. Preguntar al profesor cuál vale.
-- [ ] SQL oficial de las 10 tablas (columnas, llaves y FK).
-- [ ] ¿Las tablas puente llevan `activo`?
-- [ ] Nombre de la columna contador en `universidad`.
-- [ ] Maestro-detalle exactos según la guía de la v2.
+## D11 — El formulario del grupo tiene cinco renglones fijos
 
-## Qué viene después
+**Alternativas descartadas:** un botón «agregar renglón» con JavaScript, o una
+pantalla de dos pasos (primero el grupo, después los semilleros).
+**Decisión:** cinco casillas (`detalle_nombre[]`); las vacías se ignoran.
+**Por qué:** un formulario que crezca necesita JavaScript, y esta versión no
+lo usa. La pantalla de dos pasos resolvía eso, pero rompía lo que la versión
+enseña: **el maestro y su detalle se guardan juntos, en una sola operación.**
+Partirla permitiría un grupo a medias.
 
-- **v3:** login, JWT y roles.
-- **v4:** consultas de varias tablas, dashboard y publicación.
+**Precio asumido, declarado en la spec y no escondido:** un grupo de seis
+semilleros no cabe en una sola pasada. Es una limitación **de la pantalla**; la
+API acepta los que sean.
+
+## D12 — No se hacen disparadores
+
+**Alternativa descartada:** el contador `total_grupos` con tres triggers y
+`sp_recontar_grupos`, que era lo que mis borradores anteriores incluían.
+**Decisión:** **ningún disparador.**
+**Por qué:** la guía de la v2 dice que no se piden y que no suman nota. El
+ejemplo de clase los usa porque su factura calcula totales y mueve stock; el
+grupo de investigación no tiene nada así que lo necesite. Copiarlos «para
+cumplir» un criterio que no existe es sumar complejidad sin razón.
+
+**Precio asumido:** se pierde la oportunidad de practicar triggers. Si más
+adelante se quiere uno, se hace aparte, sin tocar lo que ya funciona.
+
+## D13 — Se agrega `activo` a las tablas de la v2 que no lo tengan
+
+**Alternativa descartada:** borrado físico (`DELETE FROM`).
+**Decisión:** `ALTER TABLE ... ADD COLUMN IF NOT EXISTS activo TINYINT(1) NOT NULL DEFAULT 1`
+en `db/procedimientos_v2.sql`, y todo `DELETE` pasa a ser `UPDATE ... SET activo = 0`.
+**Por qué:** las tablas del módulo no traen la columna; solo `rol` y `usuario`
+la tienen. Sin ella no hay borrado lógico, y la v2 entera (listados,
+desplegables, `sp_eliminar_*`) está montada sobre él.
+
+**Precio asumido:** cada listado y cada desplegable tienen que acordarse del
+`WHERE activo = 1`. Olvidarlo es de los errores más frecuentes, y se nota
+porque lo retirado sigue apareciendo.
+
+`ADD COLUMN IF NOT EXISTS` es de MariaDB (en MySQL no funciona). Permite correr
+el script varias veces sin error.
+
+## D14 — La documentación y el código dicen lo mismo
+
+**Alternativa descartada:** escribir el spec kit al final, como informe.
+**Decisión:** el spec kit se escribe **antes**, y el `9_checklist.md` incluye
+una revisión de que cada ruta, código y nombre documentado existe en el
+código.
+**Por qué:** un spec kit escrito al final es un informe de lo que se hizo, y
+no sirvió para decidir nada. Y la sustentación pide explicar un archivo en voz
+alta: solo se puede explicar bien lo que se entiende, y lo que se entiende es
+lo que está escrito antes.
+
+Para que quien abra la carpeta sepa qué hay: un `README.md` por carpeta con
+una frase por archivo, un comentario de apertura en cada archivo PHP (qué es y
+qué NO hace) y nombres que dicen lo que hacen (`ControladorGrupoInvestigacion`,
+no `Ctrl1`).
+
+## Pendientes
+
+- [ ] El SQL oficial: columnas, llaves y FK de las tablas de la v2.
+- [ ] Si `semillero` apunta a `grupo_investigacion` (D3).
+- [ ] Si las tablas puente llevan `activo` (D9).
+- [ ] Si el profesor acepta el SQLSTATE `'45001'` (D6) y `JSON_TABLE` (D5).
+- [ ] Si el semillero necesita `DELETE` propio (D8).
+- [ ] Si se quiere la doble defensa del retiro (D7).
+- [ ] Si el script oficial tiene errores que corregir. Si los hay, cada
+      corrección se escribe aquí con su motivo y cómo se encontró, en una
+      decisión nueva (D15 en adelante).
