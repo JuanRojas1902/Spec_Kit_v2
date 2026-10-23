@@ -1,203 +1,46 @@
-# Cambios en el modelo de datos — v2
+# Modelo de datos — Versión 2: tablas con llave foránea y un maestro-detalle
 
-> **Estado:** borrador. Los `[NECESITA ACLARACIÓN]` se resuelven con el SQL
-> oficial antes de programar.
+> **Versión 2** · La base sigue siendo `investigacion` (MariaDB). Lo que cambia
+> es **cuánto de ella usa el código**: de seis tablas de catálogo sin relaciones
+> a trece, con sus llaves foráneas y, por primera vez, procedimientos
+> almacenados.
+>
+> Este documento es el que hay que tener al lado mientras se construye:
+> explica no solo qué columnas hay, sino **quién defiende qué**.
 
-La v2 **no crea tablas nuevas**: las 19 tablas del módulo ya existen desde el
-primer arranque. Lo que cambia es:
+> **Estado:** las tablas marcadas **[PROPUESTA]** no vienen de un esquema
+> oficial verificado. Se contrastan con `db_scripts/mysql/investigacion.sql`
+> (Art. 5). Si el oficial difiere, manda el oficial.
 
-1. Una columna nueva en `universidad` (para el disparador).
-2. El campo `activo` donde todavía no exista.
-3. Los procedimientos almacenados y los triggers.
+---
 
-## 1. Columna para el disparador (propuesta A)
+## 1. El script de la BD (artefacto de esta versión)
 
-Para cumplir el criterio de tener **al menos un disparador funcionando**,
-`universidad` (maestro) guarda cuántos grupos de investigación activos tiene
-(detalle).
+Son dos archivos que Docker ejecuta en orden alfabético al crear el volumen:
 
-| Dato | Valor |
+| Archivo | Qué hace |
 |---|---|
-| Tabla modificada | `universidad` |
-| Columna agregada | `total_grupos INT NOT NULL DEFAULT 0` |
-| Tabla que la alimenta | `grupo_investigacion` |
-| Quién la calcula | Un procedimiento llamado por 3 triggers |
+| `db/init.sql` | La v1: crea `investigacion` y las seis tablas de catálogo, con `activo` y sus datos de ejemplo. **No se toca** |
+| `db/procedimientos_v2.sql` | La v2: crea las tablas nuevas, sus semillas y los cinco procedimientos del grupo. Se puede correr varias veces (`IF NOT EXISTS`, `CREATE OR REPLACE`) |
 
-**Justificación:** evita un `COUNT()` en cada consulta y deja un ejemplo claro
-de lo que hace un disparador: el dato cambia solo, sin que la API lo envíe.
+**Cambios al esquema** (van numerados en la cabecera del script, Art. 5):
 
-```sql
-ALTER TABLE universidad
-    ADD COLUMN IF NOT EXISTS total_grupos INT NOT NULL DEFAULT 0;
-```
-
-`ADD COLUMN IF NOT EXISTS` permite correr el script varias veces sin error.
-
-Después de crear la columna hay que **calcular el valor inicial**, porque las
-universidades que ya tienen grupos arrancarían con `0`:
-
-```sql
-UPDATE universidad u
-SET total_grupos = (SELECT COUNT(*) FROM grupo_investigacion g
-                    WHERE g.universidad_id = u.id AND g.activo = 1);
-```
-
-`[NECESITA ACLARACIÓN: nombre real de la FK en grupo_investigacion (aquí universidad_id).]`
-
-### Reglas de `total_grupos`
-
-- Es **solo de lectura** para el cliente. Igual que `activo`, no se envía en
-  `POST`, `PUT` ni `PATCH`.
-- `sp_crear_universidad` y `sp_actualizar_universidad` **no reciben** este
-  campo.
-- Solo lo modifica el procedimiento de recuento.
-- Aparece en la respuesta de `universidad` como dato informativo.
-
-## 2. Triggers
-
-En MariaDB un trigger atiende **un solo evento**, así que son tres, sobre
-`grupo_investigacion`, y los tres llaman al mismo procedimiento.
-
-| Trigger | Evento | Qué recuenta |
+| # | Cambio | Motivo |
 |---|---|---|
-| `trg_grupo_ai` | `AFTER INSERT` | La universidad del grupo nuevo |
-| `trg_grupo_au` | `AFTER UPDATE` | La universidad nueva y la anterior |
-| `trg_grupo_ad` | `AFTER DELETE` | La universidad del grupo borrado |
+| C1 | `activo` en `docente`, `grupo_investigacion` y `semillero` | Borrado lógico (Art. 6) |
+| C2 | Las siete tablas puente **no** llevan `activo` | Volver a asignar una pareja retirada chocaría con la llave primaria y daría un 409 absurdo |
+| C3 | Ningún disparador | La v2 no los pide |
 
-```sql
-DELIMITER $$
+> **Ojo con el nombre de la base:** `MARIADB_DATABASE` en el
+> `docker-compose.yml` debe ser **`investigacion`**, igual que en el script.
+> Si dice otro nombre, los `.sql` corren en una base distinta de la que lee la API.
 
-CREATE OR REPLACE PROCEDURE sp_recontar_grupos(IN p_universidad INT)
-BEGIN
-    UPDATE universidad
-    SET total_grupos = (SELECT COUNT(*) FROM grupo_investigacion
-                        WHERE universidad_id = p_universidad AND activo = 1)
-    WHERE id = p_universidad;
-END$$
-
-CREATE OR REPLACE TRIGGER trg_grupo_ai
-AFTER INSERT ON grupo_investigacion
-FOR EACH ROW
-    CALL sp_recontar_grupos(NEW.universidad_id)$$
-
-CREATE OR REPLACE TRIGGER trg_grupo_au
-AFTER UPDATE ON grupo_investigacion
-FOR EACH ROW
-BEGIN
-    CALL sp_recontar_grupos(NEW.universidad_id);
-    IF OLD.universidad_id <> NEW.universidad_id THEN
-        CALL sp_recontar_grupos(OLD.universidad_id);
-    END IF;
-END$$
-
-CREATE OR REPLACE TRIGGER trg_grupo_ad
-AFTER DELETE ON grupo_investigacion
-FOR EACH ROW
-    CALL sp_recontar_grupos(OLD.universidad_id)$$
-
-DELIMITER ;
-```
-
-Puntos importantes:
-
-- El trigger de `UPDATE` es **imprescindible**: con borrado lógico, retirar un
-  grupo es un `UPDATE`.
-- El trigger está en `grupo_investigacion` y modifica `universidad`. Si
-  modificara su propia tabla fallaría (error 1442).
-- Se comprueba **desde la pantalla**: crear o retirar un grupo cambia el
-  contador de su universidad sin que la API lo envíe.
-
-## 3. El campo `activo` en las tablas de la v2
-
-`activo TINYINT(1) NOT NULL DEFAULT 1` es el mismo campo de la v1.
-
-| Tipo de tabla | Qué se hace |
-|---|---|
-| Maestras (`docente`, `grupo_investigacion`, `semillero`) | Si no tiene `activo`, se agrega con `ALTER` |
-| Puente | `[NECESITA ACLARACIÓN: ¿llevan activo o se borran físicamente?]` |
-
-```sql
-ALTER TABLE docente
-    ADD COLUMN IF NOT EXISTS activo TINYINT(1) NOT NULL DEFAULT 1;
-```
-
-Se repite para cada tabla que lo necesite.
-
-Reglas (iguales a la v1):
-
-- El cliente **no envía** `activo`.
-- Listados, consultas y desplegables filtran `activo = 1`.
-- `sp_eliminar_*` cambia `activo` a `0`; nunca borra la fila.
-
-> [!NOTE]
-> Si el SQL oficial ya trae `activo`, no hace falta el `ALTER`. Hay que
-> confirmarlo antes de escribir el script.
-
-## 4. Procedimientos almacenados
-
-Toda operación de las 10 tablas pasa por un procedimiento con el nombre
-`sp_<acción>_<tabla>`:
-
-| Operación | Procedimiento | Qué hace |
-|---|---|---|
-| Listar | `sp_listar_<tabla>` | `SELECT` con `activo = 1` |
-| Ver uno | `sp_consultar_<tabla>` | `SELECT` por llave con `activo = 1` |
-| Crear | `sp_crear_<tabla>` | `INSERT` y devuelve la fila guardada |
-| Actualizar | `sp_actualizar_<tabla>` | `UPDATE` de los campos editables |
-| Retirar | `sp_eliminar_<tabla>` | `UPDATE ... SET activo = 0` |
-
-Reglas:
-
-- Se escriben con `DELIMITER $$` y `CREATE OR REPLACE PROCEDURE`.
-- `sp_crear_*` devuelve la fila con un `SELECT` final (MariaDB no tiene
-  `RETURNING`). Si la llave es `AUTO_INCREMENT`, guarda `LAST_INSERT_ID()` en
-  una variable antes de otra sentencia.
-- `PUT` y `PATCH` usan el mismo `sp_actualizar_*`: el servicio lee el
-  registro actual, mezcla los datos enviados y llama con todos los campos.
-- `sp_eliminar_*` de un **maestro** revisa si tiene hijos activos y, si los
-  tiene, lanza `SIGNAL SQLSTATE '45000'`.
-- Los procedimientos de las **tablas puente** son `sp_listar_`, `sp_crear_` y
-  `sp_eliminar_`. No llevan `sp_actualizar_`, porque una pareja no se edita.
-
-Ejemplo (`semillero` de un grupo):
-
-```sql
-DELIMITER $$
-
-CREATE OR REPLACE PROCEDURE sp_eliminar_grupo_investigacion(IN p_id INT)
-BEGIN
-    IF EXISTS (SELECT 1 FROM semillero
-               WHERE grupo_id = p_id AND activo = 1) THEN
-        SIGNAL SQLSTATE '45000'
-            SET MESSAGE_TEXT = 'Primero retire los semilleros de este grupo.';
-    END IF;
-
-    UPDATE grupo_investigacion SET activo = 0 WHERE id = p_id AND activo = 1;
-END$$
-
-DELIMITER ;
-```
-
-`[NECESITA ACLARACIÓN: nombres reales de las columnas (grupo_id, id...).]`
-
-## 5. Reglas de retiro (maestro con detalle)
-
-| Maestro | Se bloquea si tiene… |
-|---|---|
-| `universidad` | grupos de investigación activos |
-| `grupo_investigacion` | semilleros activos |
-| `linea_investigacion` | docentes activos |
-
-`[NECESITA ACLARACIÓN: confirmar estas parejas con la guía de la v2.]`
-
-Las filas de tablas puente sí se pueden retirar solas.
-
-## 6. Diagrama de las relaciones
+## 2. El mapa de las tablas que usa la v2
 
 ```mermaid
 erDiagram
     universidad ||--o{ grupo_investigacion : tiene
-    grupo_investigacion ||--o{ semillero : tiene
+    grupo_investigacion ||--o{ semillero : "tiene (maestro-detalle)"
     docente }o--o{ grupo_investigacion : participa_grupo
     docente }o--o{ semillero : participa_semillero
     grupo_investigacion }o--o{ linea_investigacion : grupo_linea
@@ -207,45 +50,213 @@ erDiagram
     area_aplicacion }o--o{ linea_investigacion : aa_linea
 ```
 
-`[NECESITA ACLARACIÓN: confirmar columnas, llaves y FK con el SQL oficial.]`
+Léalo así: **hay tablas de las que otras dependen** (las de la v1, y `docente`)
+y tablas que dependen de alguien (`grupo_investigacion`, `semillero` y las
+puente). Esa forma decide dos cosas prácticas:
 
-## 7. Tablas de la v2
+- **Para crear**, se va de las que no dependen a las que sí: primero la
+  universidad, después el grupo, después el semillero. Al revés, la base
+  rechaza (error 1452).
+- **Para retirar**, al revés: primero los semilleros, después el grupo. Con
+  borrado lógico la base **no** lo impide sola (es un `UPDATE`), así que lo
+  impide el procedimiento con un `SIGNAL`.
 
-| Tabla | Tipo | Columnas | FK |
+Los dos rechazos son los que la API traduce a **409**.
+
+## 3. Las tablas, una por una
+
+### 3.1 Las seis de la v1 — no se tocan
+
+`area_conocimiento`, `objetivo_desarrollo_sostenible`, `area_aplicacion`,
+`termino_clave`, `universidad` y `linea_investigacion`. Su estructura está en
+el `5_data_model.md` de la v1. En la v2 pasan a ser **los padres** que
+alimentan los desplegables.
+
+### 3.2 `docente` **[PROPUESTA]** — no depende de nadie
+
+| Columna | Tipo | Restricción | Descripción |
 |---|---|---|---|
-| `docente` | Maestra | `[NECESITA ACLARACIÓN]` | `[NECESITA ACLARACIÓN]` |
-| `grupo_investigacion` | Maestra | `[NECESITA ACLARACIÓN]` | `universidad_id` (supuesta) |
-| `semillero` | Maestra | `[NECESITA ACLARACIÓN]` | `grupo_id` (supuesta) |
-| `participa_grupo` | Puente | docente + grupo | 2 |
-| `participa_semillero` | Puente | docente + semillero | 2 |
-| `grupo_linea` | Puente | grupo + línea | 2 |
-| `semillero_linea` | Puente | semillero + línea | 2 |
-| `ac_linea` | Puente | área de conocimiento + línea | 2 |
-| `ods_linea` | Puente | ODS + línea | 2 |
-| `aa_linea` | Puente | área de aplicación + línea | 2 |
+| `cedula` | INT | **PK** | La escribe quien crea la ficha |
+| `nombres` | VARCHAR(100) | NOT NULL | |
+| `apellidos` | VARCHAR(100) | NOT NULL | |
+| `activo` | TINYINT(1) | NOT NULL, DEFAULT 1 | **Solo lo cambia `DELETE`** |
 
-Las llaves de las tablas puente son **compuestas**: repetir una pareja da
-error `1062`, que la API responde `409`.
+Es el padre de dos tablas puente (`participa_grupo` y `participa_semillero`).
+
+### 3.3 `grupo_investigacion` — **el maestro**
+
+| Columna | Tipo | Restricción | Quién lo escribe |
+|---|---|---|---|
+| `id` | INT | **PK, AUTO_INCREMENT** | **la base** |
+| `gruplac` | VARCHAR(255) | NOT NULL | la API |
+| `categoria` | VARCHAR(50) | NOT NULL | la API |
+| `convocatoria` | VARCHAR(255) | NOT NULL | la API |
+| `ambito` | VARCHAR(255) | NOT NULL | la API |
+| `universidad_id` | INT | **FK → universidad**, NOT NULL | la API |
+| `activo` | TINYINT(1) | NOT NULL, DEFAULT 1 | **el procedimiento de retirar** |
+
+El grupo **no tiene `nombre`**: se identifica por su `gruplac`. Y como el `id`
+lo genera la base, el `POST` **no lo lleva** y la respuesta **sí lo devuelve**.
+
+### 3.4 `semillero` **[PROPUESTA]** — **el detalle**
+
+| Columna | Tipo | Restricción | Quién lo escribe |
+|---|---|---|---|
+| `id` | INT | **PK, AUTO_INCREMENT** | **la base** |
+| `nombre` | VARCHAR(100) | NOT NULL | la API |
+| `grupo_id` | INT | **FK → grupo_investigacion**, NOT NULL | **el procedimiento** (toma el id del grupo que acaba de crear) |
+| `activo` | TINYINT(1) | NOT NULL, DEFAULT 1 | **el procedimiento** |
+
+**Un semillero no existe sin su grupo.** Por eso no se crea suelto: nace dentro
+del `sp_crear_grupo_investigacion`. Lea la columna «quién lo escribe»: la API
+**no manda** `grupo_id`; el procedimiento lo pone con `LAST_INSERT_ID()`.
+
+### 3.5 Las siete tablas puente **[PROPUESTA]**
+
+Su llave primaria es **compuesta**: las dos llaves foráneas juntas. Por eso una
+pareja no puede repetirse (error 1062 → `409`), y por eso **no se editan**:
+cambiar un lado es otra pareja, o sea retirar una y asignar otra.
+
+| Tabla | Columnas (= llave) | Apuntan a |
+|---|---|---|
+| `participa_grupo` | `docente_cedula`, `grupo_id` | `docente`, `grupo_investigacion` |
+| `participa_semillero` | `docente_cedula`, `semillero_id` | `docente`, `semillero` |
+| `grupo_linea` | `grupo_id`, `linea_id` | `grupo_investigacion`, `linea_investigacion` |
+| `semillero_linea` | `semillero_id`, `linea_id` | `semillero`, `linea_investigacion` |
+| `ac_linea` | `area_conocimiento_id`, `linea_id` | `area_conocimiento`, `linea_investigacion` |
+| `ods_linea` | `ods_id`, `linea_id` | `objetivo_desarrollo_sostenible`, `linea_investigacion` |
+| `aa_linea` | `area_aplicacion_id`, `linea_id` | `area_aplicacion`, `linea_investigacion` |
+
+**Sin `activo`:** retirar una pareja es un `DELETE FROM`. Si llevaran `activo`,
+volver a asignar una pareja retirada chocaría con su propia llave.
+
+## 4. La lógica que vive en la base
+
+### 4.1 Los cinco procedimientos del maestro-detalle
+
+Solo para `grupo_investigacion → semillero`. Las demás tablas usan SQL con
+parámetros `?` en su repositorio, como en la v1.
+
+| Procedimiento | Qué hace | Devuelve | Lo llama |
+|---|---|---|---|
+| `sp_listar_grupo_investigacion()` | Los grupos activos | 1 resultado | `obtenerTodos()` |
+| `sp_consultar_grupo_investigacion(id)` | Un grupo y sus semilleros activos | 2 resultados | `obtenerPorId()` |
+| `sp_crear_grupo_investigacion(..., detalle)` | Crea el grupo y todos sus semilleros | 2 resultados | `crear()` |
+| `sp_actualizar_grupo_investigacion(id, ..., detalle)` | Reemplaza el grupo y **todo** el detalle (`PUT`) | 2 resultados | `reemplazar()` |
+| `sp_eliminar_grupo_investigacion(id)` | Retira el grupo (`activo = 0`) | nada | `eliminar()` |
+
+Cómo funcionan, para poder explicarlo en voz alta:
+
+- **El detalle viaja como un solo parámetro JSON**: `[{"nombre":"Semillero A"}]`.
+  El procedimiento lo recorre con `JSON_TABLE` (pide MariaDB 10.6 o superior;
+  la imagen `mariadb:11` lo cumple).
+- **Todo o nada:** crear y actualizar abren una transacción y tienen un
+  `EXIT HANDLER FOR SQLEXCEPTION` que hace `ROLLBACK` y `RESIGNAL`. Si falla
+  el tercer semillero, no queda ni el grupo.
+- **El `LAST_INSERT_ID()` se guarda en una variable al instante**, antes de
+  cualquier otra sentencia: otro `INSERT` lo cambiaría.
+- **Devuelven lo que quedó guardado**, no lo que mandó el formulario (MariaDB
+  no tiene `RETURNING`). Por eso la respuesta trae el `id` generado.
+- **`PUT` retira los semilleros de antes y reinserta los nuevos**, así que los
+  semilleros cambian de `id` en cada `PUT`.
+
+### 4.2 Las dos señales que lanzan los procedimientos
+
+| SQLSTATE | Cuándo | La API responde |
+|---|---|---|
+| `45001` | El grupo no existe o está retirado | `404` |
+| `45000` | Se intenta retirar un grupo con semilleros activos | `409` con el mensaje del `SIGNAL` |
+
+> `45001` es una decisión de esta versión: la guía solo nombra `45000`. Se
+> prefiere a distinguir los casos leyendo el **texto** del mensaje, que es
+> frágil. Si el profesor no la acepta, se cambia en `errores_de_integridad.php`.
+
+### 4.3 Las demás defensas son de la llave
+
+| Qué pasa | Quién lo rechaza | Error del motor | La API responde |
+|---|---|---|---|
+| Crear con un `universidad_id` que no existe | La llave foránea | 1452 | `409` |
+| Repetir una pareja en una puente | La llave primaria | 1062 | `409` |
+| Borrar un padre con hijos (solo borrado físico) | La llave foránea | 1451 | `409` |
+
+El 1451 casi no se dispara con borrado lógico, pero se sigue traduciendo por
+seguridad.
+
+### 4.4 Las tablas que la v2 no toca
+
+`rol`, `usuario` y `rol_usuario` son del control de acceso (v3). **El código de
+la v2 no puede nombrarlas.**
+
+## 5. Los datos de ejemplo de los que dependen las pruebas
+
+El `7_quickstart.md` cuenta con esto. Si alguien cambia los datos, hay que
+actualizarlo.
+
+| Tabla | Cuántos | Un ejemplo que se usa en las pruebas |
+|---|---|---|
+| `universidad` | 2 | `id = 1` Monte Verde — es el padre del grupo 1 |
+| `linea_investigacion` | 2 | `id = 1` Desarrollo de Software |
+| `docente` | 2 | `cedula = 1017245` Ana Torres Gómez |
+| `grupo_investigacion` | 1 | `id = 1` — **tiene 2 semilleros**: retirarlo debe dar `409` |
+| `semillero` | 2 | Los dos pertenecen al grupo 1 |
+| `grupo_linea` | 1 | La pareja `(1, 1)` — repetirla debe dar `409` |
+
+> Los números de la v1 (218, 17, 21 y 6) son los del dataset oficial. El
+> `init.sql` actual solo trae 2 por tabla. Si cargas el dataset completo,
+> actualiza esta tabla y la del quickstart de la v1.
+
+**Para que esos datos existan**, agrega esto al final de la sección de
+semillas de `db/procedimientos_v2.sql` (después de crear las tablas):
+
+```sql
+INSERT IGNORE INTO grupo_investigacion (id, gruplac, categoria, convocatoria, ambito, universidad_id)
+VALUES (1, 'COL0001', 'A', 'Convocatoria 2024', 'Nacional', 1);
+
+INSERT IGNORE INTO semillero (id, nombre, grupo_id) VALUES
+(1, 'Semillero de Visión Artificial', 1),
+(2, 'Semillero de Lenguaje Natural', 1);
+
+INSERT IGNORE INTO grupo_linea (grupo_id, linea_id) VALUES (1, 1);
+```
+
+## 6. Montar la BD
+
+```powershell
+docker compose up -d mariadb      # desde la raíz del proyecto
+```
+
+Y el botón de pánico, que en esta versión se usa más porque las pruebas crean y
+retiran registros:
+
+```powershell
+docker compose down -v && docker compose up -d --build
+```
+
+`down -v` borra el volumen, así que los dos `.sql` vuelven a ejecutarse y la
+base queda como recién nacida.
+
+## 7. Qué toca el código en cada versión
+
+| Versión | Tablas que usa el código (API **y** pantalla) |
+|---|---|
+| v1 | Las 6 de catálogo |
+| **v2** | **+ `docente`, `grupo_investigacion`, `semillero` y las 7 puente** |
+| v3 | **+ `usuario`, `rol` y `rol_usuario`** |
 
 ## 8. Lo que NO se cambia
 
-- Las columnas, tipos y llaves del SQL oficial, salvo `total_grupos` y `activo`.
-- Si hay nombres raros (como `universidsad` o `nacionalidaad`), se dejan
-  igual.
-- Las seis tablas de la v1, salvo `universidad`, que recibe `total_grupos`.
-
-> [!WARNING]
-> `universidad` ya existía en la v1. Agregarle `total_grupos` **no debe romper
-> la regresión**: su CRUD de la v1 tiene que seguir funcionando igual.
+- Las seis tablas de la v1 y sus datos.
+- Nombres de columnas y tipos del esquema oficial, aunque tengan errores de
+  digitación.
 
 ## 9. El modelo está listo cuando…
 
-- [ ] `universidad` tiene `total_grupos` y arranca con el valor correcto.
-- [ ] Las tablas de la v2 tienen `activo` (o se decidió qué pasa con las puente).
-- [ ] Existen los cinco procedimientos de cada maestro y los de las puente.
-- [ ] Los procedimientos corren dos veces seguidas sin error.
-- [ ] Existen `sp_recontar_grupos` y los 3 triggers.
-- [ ] Crear y retirar un grupo cambia `total_grupos` solo.
-- [ ] Retirar un maestro con hijos activos lanza el `SIGNAL`.
-- [ ] El cliente no puede enviar `activo` ni `total_grupos`.
-- [ ] Todo está en el script de la base y versionado.
+- [ ] `docker compose up -d --build` crea todo sin error y el script corre dos veces seguidas.
+- [ ] `MARIADB_DATABASE` y el script usan el mismo nombre: `investigacion`.
+- [ ] La cabecera del script numera los cambios al esquema (C1 a C3).
+- [ ] Las llaves foráneas rechazan padres inexistentes (1452).
+- [ ] Crear un grupo con 3 semilleros guarda los 4 registros, o ninguno.
+- [ ] Retirar un grupo con semilleros activos lanza `45000`.
+- [ ] Un grupo inexistente lanza `45001`.
+- [ ] Repetir una pareja en una puente da 1062.
+- [ ] Los datos de §5 existen y coinciden con el quickstart.
