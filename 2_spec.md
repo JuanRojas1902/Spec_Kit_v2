@@ -13,7 +13,7 @@
 > | [6_contratos.md](6_contratos.md) | Endpoints y pantallas |
 > | [7_quickstart.md](7_quickstart.md) | Arranque y pruebas |
 > | [8_tasks.md](8_tasks.md) | Orden de construcción |
-> | [9_checklist.md](9_checklist.md) | Lista de cierre firmada |
+> | [9_checklist.md](9_checklist.md) | Lista de chequeo de la spec, firmada |
 > | [GUIA_IA2.md](GUIA_IA2.md) | Prompts usados y correcciones a la IA |
 
 ## 1. Propósito
@@ -24,15 +24,18 @@ La v1 dejó seis catálogos que no dependían de nadie. La v2 enseña qué pasa 
 2. **Nadie digita llaves.** Se escogen de un desplegable con nombres.
 3. **Una operación son varias escrituras.** Guardar un grupo con sus semilleros es todo o nada.
 4. **Parte del negocio vive en la base.** El maestro-detalle se guarda con procedimientos almacenados.
+5. **No todo recurso es un CRUD.** El grupo no tiene `PATCH`, el semillero no se crea suelto y una pareja de una tabla puente no se edita.
 
 ## 2. Alcance
 
 **Incluye:**
 
-| Tipo | Tablas |
-|---|---|
-| Maestras | `docente`, `grupo_investigacion`, `semillero` |
-| Puente | `participa_grupo`, `participa_semillero`, `grupo_linea`, `semillero_linea`, `ac_linea`, `ods_linea`, `aa_linea` |
+| Clase | Tablas | Qué admite |
+|---|---|---|
+| Ficha | `docente` | Los seis verbos de la v1 |
+| Maestro-detalle | `grupo_investigacion` (con su detalle `semillero`) | Todo menos `PATCH`; por procedimientos almacenados |
+| Solo lectura | `semillero` | Solo `GET`: nace y se retira por medio del grupo |
+| Puente | `participa_grupo`, `participa_semillero`, `grupo_linea`, `semillero_linea`, `ac_linea`, `ods_linea`, `aa_linea` | Listar, asignar y retirar |
 
 - **UN maestro-detalle completo: `grupo_investigacion → semillero`**, con sus cinco verbos por procedimientos almacenados.
 - Desplegables en todas las llaves foráneas, cargados desde la API.
@@ -41,7 +44,7 @@ La v1 dejó seis catálogos que no dependían de nadie. La v2 enseña qué pasa 
 
 **No incluye (deliberado):**
 
-- Los otros maestro-detalle (`universidad → grupo_investigacion`, `linea_investigacion → docente`): quedan como CRUD corriente.
+- Los otros maestro-detalle (`universidad → grupo_investigacion`, `linea_investigacion → docente`): quedan como CRUD corriente de sus tablas.
 - Disparadores: la v2 no los pide.
 - Login, JWT, roles y `usuario`/`rol`/`rol_usuario` (v3).
 - Consultas multitabla, dashboard y publicación (v4).
@@ -52,13 +55,14 @@ La v1 dejó seis catálogos que no dependían de nadie. La v2 enseña qué pasa 
 ### 3.A La API
 
 - **RF1 — La v1 sigue igual.** Sus seis recursos responden como antes.
-- **RF2 — Fichas.** `docente` y `semillero` ofrecen listar (`?limite`), ver uno, `POST`, `PUT`, `PATCH` y `DELETE` en su propia ruta. Sobre `{tabla, limite, total, datos}`; tabla vacía → `204`. `activo` nunca viaja en el body.
+- **RF2 — Ficha `docente`.** Ofrece listar (`?limite`), ver uno, `POST`, `PUT`, `PATCH` y `DELETE` en `/api/docente`. Sobre `{tabla, limite, total, datos}`; tabla vacía → `204`. Cédula no entera → `400`. `activo` nunca viaja en el body.
 - **RF3 — Tablas puente.** `GET` lista, `POST` asigna una pareja, `DELETE /api/<tabla>/{clave1}/{clave2}` retira. Pareja repetida → `409`. Pareja que no existe → `404`. `PUT` y `PATCH` → `405`.
-- **RF4 — Maestro-detalle.** `POST /api/grupo_investigacion` recibe el grupo y su lista de semilleros en el mismo body, y devuelve el grupo completo con su detalle. Si un semillero falla, **no se guarda nada**. El error dice **cuál** renglón falla.
+- **RF4 — Maestro-detalle.** `POST /api/grupo_investigacion` recibe el grupo y su lista de semilleros en el mismo body y devuelve el grupo completo con su detalle y sus `id`. Si un semillero falla, **no se guarda nada**. El error dice **cuál** renglón falla. Un grupo sin semilleros (`"detalle": []`) es válido.
 - **RF5 — Procedimientos.** Listar, consultar, crear, actualizar y eliminar del grupo van por `CALL sp_..._grupo_investigacion(?, ...)`. El repositorio no escribe SQL a mano.
 - **RF6 — Reemplazar.** `PUT /api/grupo_investigacion/{id}` reemplaza el encabezado y todo el detalle. `PATCH` → `405`.
-- **RF7 — Retirar.** `DELETE` es borrado lógico. Con semilleros activos → `409` con el mensaje del `SIGNAL`.
-- **RF8 — Integridad.** La base defiende, la API traduce; nunca `500`:
+- **RF7 — Retirar.** `DELETE` del grupo es borrado lógico. Con semilleros activos → `409` con el mensaje del `SIGNAL`. Grupo inexistente o ya retirado → `404`.
+- **RF8 — Semillero de solo lectura.** `GET /api/semillero` y `GET /api/semillero/{id}` leen; `POST`, `PUT`, `PATCH` y `DELETE` → `405`. Un semillero nace y se retira solo por medio del grupo.
+- **RF9 — Integridad.** La base defiende, la API traduce; nunca `500`:
 
   | Caso | Respuesta |
   |---|---|
@@ -68,18 +72,18 @@ La v1 dejó seis catálogos que no dependían de nadie. La v2 enseña qué pasa 
   | Regla del procedimiento (`SIGNAL '45000'`) | `409` con su mensaje |
   | Grupo inexistente (`SIGNAL '45001'`) | `404` |
 
-- **RF9 — Diagnóstico.** `GET /` responde `"version": "v2"` y la lista de recursos.
+- **RF10 — Diagnóstico.** `GET /` responde `"version": "v2"` y la lista de los 16 recursos.
 
 ### 3.B El front (`front_php`)
 
-- **RF10 — Una sección por recurso**, con menú desde cualquier pantalla.
-- **RF11 — Desplegables.** Cada llave foránea es un `<select>` que muestra el nombre y manda la clave, solo con registros activos. Si es opcional, lleva «(ninguna)» y manda `null`. Todo texto de la base pasa por `htmlspecialchars` (Art. 9).
-- **RF12 — El grupo se ve con su detalle.** Sus semilleros aparecen en la misma pantalla y se agregan ahí, en **un solo envío** (campos `detalle_nombre[]`). Son cinco renglones fijos; los vacíos se ignoran. Es una limitación de la pantalla, no de la API.
-- **RF13 — Puente.** Se asignan y se retiran; no hay botón de editar.
-- **RF14 — Los rechazos se leen en español**, sin números de estado ni jerga.
-- **RF15 — Lista vacía.** Un `204` se muestra como «todavía no hay datos».
-- **RF16 — La pantalla sobrevive a la API caída** (Art. 1.1): con su menú, su aviso y sin filas.
-- **RF17 — Identidad visual.** Los estilos usan `var(--umv-...)` de `marca.css`; los errores van en rojo alerta, no en ocre (Art. 12).
+- **RF11 — Desplegables.** Cada llave foránea es un `<select>` que muestra el nombre y manda la clave, solo con registros activos. Todo texto de la base pasa por `htmlspecialchars` (Art. 9). Si alguna llave fuera opcional, llevaría «(ninguna)» y mandaría `null`; hoy ninguna lo es.
+- **RF12 — El grupo se ve con su detalle.** Sus semilleros aparecen en la misma pantalla. Se agregan en **un solo envío** (campos `detalle_nombre[]`), con cinco renglones fijos; los vacíos se ignoran. Al editar, el formulario muestra **todos** los semilleros actuales más renglones vacíos. Es una limitación de la pantalla, no de la API.
+- **RF13 — Semilleros y puente.** La pantalla de semilleros es de solo lectura. Las puente muestran las parejas con **nombres**, se asignan con dos desplegables y se retiran; no hay botón de editar.
+- **RF14 — Una sección por recurso**, con menú desde cualquier pantalla.
+- **RF15 — Los rechazos se leen en español**, sin números de estado ni jerga, y sin perder lo escrito.
+- **RF16 — Lista vacía.** Un `204` se muestra como «todavía no hay datos» y no es un error.
+- **RF17 — La pantalla sobrevive a la API caída** (Art. 1.1): con su menú, su aviso y sin filas.
+- **RF18 — Identidad visual.** Estilos con `var(--umv-...)` de `marca.css`; errores en rojo alerta, no en ocre; el borrado lógico dice «Retirar» (Arts. 6 y 12).
 
 ## 4. Requisitos no funcionales
 
@@ -88,32 +92,35 @@ La v1 dejó seis catálogos que no dependían de nadie. La v2 enseña qué pasa 
 - **RNF3** — SQL siempre con parámetros `?` (Art. 9).
 - **RNF4** — El dialecto de MariaDB (`CALL`, números de error) vive solo en las clases `*MariaDB` y en `errores_de_integridad.php`.
 - **RNF5** — El front no usa PDO, no depende de `mariadb` y no comparte código con la API (Art. 1.1).
-- **RNF6** — La interfaz no dice «PUT», «PATCH», «422», «FK», rutas `/api/` ni nombres de columna. Dice «retirar», no «borrar» (Art. 6).
-- **RNF7** — Interpretabilidad: cada archivo tiene su cabecera (qué hace y por qué está ahí) y cada carpeta un `README.md` (Art. 1).
-- **RNF8** — Nada de v3 ni v4.
+- **RNF6** — La interfaz no dice «PUT», «PATCH», «409», «FK», rutas `/api/` ni nombres de columna.
+- **RNF7** — Interpretabilidad: cada archivo tiene su cabecera (qué es, por qué está ahí y qué NO hace) y cada carpeta un `README.md` (Art. 1).
+- **RNF8** — Ninguna ruta es genérica (Art. 10).
+- **RNF9** — Nada de v3 ni v4.
 
 ## 5. Criterios de aceptación
 
-| # | Criterio |
-|---|---|
-| 1 | `docker compose up -d --build` deja base, API (8111) y front (8110) funcionando |
-| 2 | Las tablas de la v1 siguen con CRUD completo y pantalla (regresión) |
-| 3 | Las tablas de la v2 tienen CRUD y pantalla; las puente se asignan y se retiran |
-| 4 | **Los cinco verbos del grupo pasan por procedimientos:** el repositorio tiene `CALL ... (?, ?)` y no SQL a mano |
-| 5 | **Maestro-detalle completo:** se abre un grupo, se le agregan 3 semilleros y se guardan en un solo envío; en la base están los tres o ninguno |
-| 6 | Cada llave foránea es un desplegable lleno, con nombres y solo activos |
-| 7 | La llave opcional acepta «(ninguna)» y manda `null`, no `0` |
-| 8 | Crear un hijo con padre inexistente → **409** en castellano (un 500 es criterio fallado) |
-| 9 | Repetir una pareja en una puente → **409** |
-| 10 | Retirar un grupo con semilleros activos → **409** con el mensaje del procedimiento |
-| 11 | El detalle se ve y se agrega desde el maestro |
-| 12 | Borrado lógico: desaparece de la lista y **sigue en la base** |
-| 13 | Tabla vacía → `204` y la pantalla no se rompe |
-| 14 | `PATCH /api/grupo_investigacion/{id}` → **405** |
-| 15 | Prueba de capas con repositorios falsos, sin MariaDB |
-| 16 | La interfaz no muestra jerga técnica |
-| 17 | **La regresión de la v1 pasa completa** |
-| 18 | Con la API apagada, las pantallas siguen en pie y sin filas |
+La columna «Comando» dice dónde se comprueba en [7_quickstart.md](7_quickstart.md).
+
+| # | Criterio | Comando |
+|---|---|---|
+| 1 | `docker compose up -d --build` deja base, API (`8111`) y front (`8110`) funcionando, y `GET /` responde `"version": "v2"` con 16 recursos | §1, §3.1 |
+| 2 | Las seis tablas de la v1 siguen con CRUD completo (regresión) | §3.1 |
+| 3 | `docente` tiene CRUD (cédula repetida → `409`, cédula `abc` → `400`) y las puente se asignan y se retiran | §3.2, §3.5 |
+| 4 | **Los cinco verbos del grupo pasan por procedimientos:** el repositorio tiene `CALL ... (?, ...)` y no SQL a mano | §3.3 + revisar el repositorio |
+| 5 | **Maestro-detalle completo:** un grupo con 3 semilleros se guarda en una petición y devuelve sus `id`; con `universidad_id` 999 no queda nada guardado | §3.3 |
+| 6 | Cada llave foránea es un desplegable lleno, con nombres y solo activos | §4.2 (paso 3 y 6) |
+| 7 | Un recurso no admite los verbos que no le corresponden: `POST /api/semillero` → `405` y `PUT` a una puente → `405` | §3.5, §3.6 |
+| 8 | Crear con un padre inexistente → **409** en castellano (un `500` es criterio fallado) | §3.3, §3.5 |
+| 9 | Repetir una pareja en una puente → **409** | §3.5 |
+| 10 | Retirar un grupo con semilleros activos → **409** con «Primero retire los semilleros de este grupo»; un grupo inexistente → **404** | §3.4 |
+| 11 | El detalle se ve y se agrega desde el maestro, y editar no pierde semilleros | §4.2 (pasos 3 y 4) |
+| 12 | Borrado lógico: desaparece de la lista y **sigue en la base** con `activo = 0` | §5 |
+| 13 | Tabla vacía → `204` y la pantalla no se rompe | §3.5, §4.2 (paso 7) |
+| 14 | `PATCH /api/grupo_investigacion/{id}` → **405** | §3.3 |
+| 15 | Prueba de capas con repositorios falsos, sin MariaDB | §3.7 |
+| 16 | La interfaz no muestra jerga técnica y dice «Retirar» | §4.1, §4.2 |
+| 17 | **La regresión de la v1 pasa completa** | §3.1 |
+| 18 | Con la API apagada, las pantallas siguen en pie y sin filas | §4.2 (paso 10) |
 
 ## 6. Glosario mínimo
 
@@ -124,6 +131,7 @@ La v1 dejó seis catálogos que no dependían de nadie. La v2 enseña qué pasa 
 | Maestro-detalle | Dos tablas que no tienen sentido por separado: grupo y semilleros |
 | Procedimiento almacenado | Operación guardada en la base, que se llama por su nombre |
 | Transacción | Varias escrituras que se guardan todas o ninguna |
+| Borrado lógico | Retirar un registro con `activo = 0`, sin borrar la fila |
 | 409 Conflicto | «Su petición está bien, pero no cabe en los datos que hay» |
 
 ## 7. Definición de TERMINADA
@@ -137,9 +145,11 @@ Los 18 criterios pasan → `9_checklist.md` firmado → commit → tag `v2`.
 | C1 | ¿Qué maestro-detalle? | **`grupo_investigacion → semillero`.** Un semillero no existe sin su grupo. |
 | C2 | ¿Se retira un grupo con semilleros activos? | **No: 409.** El procedimiento lanza `SIGNAL '45000'`; la base no lo impide sola porque es un `UPDATE`. |
 | C3 | ¿La API comprueba antes que el padre exista? | **No.** Se intenta y se traduce el veredicto del motor. |
-| C4 | ¿El grupo tiene `PATCH`? | **No.** El detalle se reemplaza entero con `PUT`. |
-| C5 | ¿Cómo se retira un semillero suelto? | Con el `PUT` del grupo: los que no vienen quedan en `activo = 0`. |
+| C4 | ¿El grupo tiene `PATCH`? | **No.** El detalle se reemplaza entero con `PUT`; `PATCH` → `405`. |
+| C5 | ¿Cómo se crea o retira un semillero? | **Solo por medio del grupo:** el `POST` lo crea y el `PUT` retira los que ya no vienen (`activo = 0`). `semillero` es de solo lectura. |
 | C6 | ¿Las puente llevan `activo`? | **No.** Se borran físicamente, porque volver a asignar una pareja retirada chocaría con la llave. |
 | C7 | ¿Disparadores? | **No**, la v2 no los pide. |
-| C8 | ¿Cuántos renglones ofrece el formulario? | **Cinco fijos**; los vacíos se ignoran. |
+| C8 | ¿Cuántos renglones ofrece el formulario? | **Cinco fijos** al crear; al editar, todos los actuales más vacíos. |
 | C9 | ¿De dónde salen las columnas de `docente`, `semillero` y las puente? | `[NECESITA ACLARACIÓN]` Son propuestas hasta contrastar con `db_scripts/mysql/investigacion.sql` (Art. 5). |
+| C10 | ¿Se retira un docente que participa en grupos o semilleros? | **Sí se permite.** Las puente no llevan `activo`, así que la base no lo impide; el docente retirado deja de aparecer en los desplegables. Decisión del equipo, sujeta a confirmación del profesor. |
+| C11 | ¿Alguna llave foránea es opcional? | **No.** Todas son `NOT NULL`; por eso no hay criterio de «(ninguna)». Si el esquema oficial trae una opcional, se agrega el criterio. |
