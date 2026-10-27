@@ -1,6 +1,6 @@
 # Decisiones — Versión 2
 
-> Porqués del plan, con alternativas descartadas. Lectura opcional.
+> ¿Por qué? del plan, con alternativas descartadas. Lectura opcional.
 
 | # | Decisión | Alternativa descartada | Por qué |
 |---|---|---|---|
