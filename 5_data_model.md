@@ -50,7 +50,7 @@ erDiagram
     area_aplicacion }o--o{ linea_investigacion : aa_linea
 ```
 
-Léalo así: **hay tablas de las que otras dependen** (las de la v1, y `docente`)
+**hay tablas de las que otras dependen** (las de la v1, y `docente`)
 y tablas que dependen de alguien (`grupo_investigacion`, `semillero` y las
 puente). Esa forma decide dos cosas prácticas:
 
