@@ -1,6 +1,6 @@
 # Plan técnico — Versión 2
 
-> CÓMO construir lo de [2_spec.md](2_spec.md). Porqués en [4_research.md](4_research.md).
+> CÓMO construir lo de [2_spec.md](2_spec.md). Porque en [4_research.md](4_research.md).
 
 ## 1. Stack
 
